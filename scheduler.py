@@ -7,6 +7,34 @@ from analyze import analyze_notam
 from db import NotamRecord, SessionLocal, init_db
 import json
 
+def build_and_populate_db():
+    init_db()
+    csv_path = "data/Airport Database - NOTAM ID.csv"
+    all_notams = fetch_notam_data_from_csv(csv_path)
+    existing_hashes = get_existing_hashes()
+    to_analyze = []
+    seen_in_run = set()  # NEW
+
+    for n in all_notams:
+        h = get_hash(n["notam_number"], n["icao_message"])
+        print(f"NOTAM: {n['notam_number']}, Hash: {h}")  # <-- This line prints the hash
+        if h in existing_hashes or h in seen_in_run:  # MODIFIED
+            print(f"⏩ Already in DB or batch, skipping {n['notam_number']} | hash: {h}")
+        else:
+            n["raw_hash"] = h
+            to_analyze.append(n)
+            seen_in_run.add(h)  # NEW
+            print(f"🆕 Will analyze: {n['notam_number']} | hash: {h}")
+
+    print(f"✅ {len(to_analyze)} new NOTAMs to analyze")
+
+    if not to_analyze:
+        print("🎉 All NOTAMs already analyzed and stored. Exiting.")
+    else:
+        asyncio.run(run_analysis(to_analyze, batch_size=800))
+
+
+
 def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
     df = pd.read_csv(csv_path, usecols=['Designator', 'URL'])
     df = df.dropna(how='all', subset=['Designator', 'URL'])
@@ -129,29 +157,30 @@ async def run_analysis(to_analyze: List[Dict], batch_size=200):
 
 
 if __name__ == "__main__":
-    init_db()
-    csv_path = "data/Airport Database - NOTAM ID.csv"
-    all_notams = fetch_notam_data_from_csv(csv_path)
-    existing_hashes = get_existing_hashes()
-    to_analyze = []
-    seen_in_run = set()  # NEW
-
-    for n in all_notams[1:500]:
-        h = get_hash(n["notam_number"], n["icao_message"])
-        print(f"NOTAM: {n['notam_number']}, Hash: {h}")  # <-- This line prints the hash
-        if h in existing_hashes or h in seen_in_run:  # MODIFIED
-            print(f"⏩ Already in DB or batch, skipping {n['notam_number']} | hash: {h}")
-        else:
-            n["raw_hash"] = h
-            to_analyze.append(n)
-            seen_in_run.add(h)  # NEW
-            print(f"🆕 Will analyze: {n['notam_number']} | hash: {h}")
-
-    print(f"✅ {len(to_analyze)} new NOTAMs to analyze")
-
-    if not to_analyze:
-        print("🎉 All NOTAMs already analyzed and stored. Exiting.")
-    else:
-        asyncio.run(run_analysis(to_analyze, batch_size=800))
+    # init_db()
+    # csv_path = "data/Airport Database - NOTAM ID.csv"
+    # all_notams = fetch_notam_data_from_csv(csv_path)
+    # existing_hashes = get_existing_hashes()
+    # to_analyze = []
+    # seen_in_run = set()  # NEW
+    #
+    # for n in all_notams[1:500]:
+    #     h = get_hash(n["notam_number"], n["icao_message"])
+    #     print(f"NOTAM: {n['notam_number']}, Hash: {h}")  # <-- This line prints the hash
+    #     if h in existing_hashes or h in seen_in_run:  # MODIFIED
+    #         print(f"⏩ Already in DB or batch, skipping {n['notam_number']} | hash: {h}")
+    #     else:
+    #         n["raw_hash"] = h
+    #         to_analyze.append(n)
+    #         seen_in_run.add(h)  # NEW
+    #         print(f"🆕 Will analyze: {n['notam_number']} | hash: {h}")
+    #
+    # print(f"✅ {len(to_analyze)} new NOTAMs to analyze")
+    #
+    # if not to_analyze:
+    #     print("🎉 All NOTAMs already analyzed and stored. Exiting.")
+    # else:
+    #     asyncio.run(run_analysis(to_analyze, batch_size=800))
+    build_and_populate_db()
 
 
