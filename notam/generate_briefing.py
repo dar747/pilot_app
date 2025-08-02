@@ -2,12 +2,19 @@
 from typing import Optional
 import os
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_API_KEY"] = "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"
 os.environ["LANGCHAIN_PROJECT"] = "PILOT"
 
 load_dotenv()
+
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+engine = create_engine(SUPABASE_DB_URL)
+SessionLocal = sessionmaker(bind=engine)
+
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY is not set in environment.")
@@ -15,7 +22,7 @@ if not openai_api_key:
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from notam.models import Notam_Briefing, Notam_Query_User_Input_Parser
-from notam.db import SessionLocal, NotamRecord
+from notam.db import NotamRecord
 from datetime import datetime
 
 llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=openai_api_key)
