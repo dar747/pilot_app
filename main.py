@@ -1,11 +1,13 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from typing import List, Optional
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-from db import Base, NotamRecord  # Don't import SessionLocal from db.py
+from notam.db import NotamRecord  # Don't import SessionLocal from db.py
 import os
+
+print("🔥 MAIN.PY LOADED")
 
 # Load Supabase DB URL from environment
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
@@ -108,3 +110,7 @@ def get_all_notams(
 @app.get("/")
 def root():
     return {"message": "✅ NOTAM API is running. Use /notams to query."}
+
+@app.get("/test")
+def test():
+    return {"message": "test is live"}

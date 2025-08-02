@@ -19,3 +19,5 @@ aiosqlite
 loguru
 python-dotenv
 psycopg2-binary
+aiohttp>=3.9.0
+
