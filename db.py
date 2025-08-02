@@ -1,21 +1,21 @@
 import os
 from sqlalchemy import create_engine, Column, String, Integer, Text, PrimaryKeyConstraint
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
 
-Base = declarative_base()
+# Load environment variables
+load_dotenv()
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_PATH = os.path.join(BASE_DIR, "notams.db")
-DATABASE_URL = f"sqlite:///{DATABASE_PATH}"
+DATABASE_URL = os.getenv("LOCAL_DB_URL")  # Read from .env file
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
 class NotamRecord(Base):
     __tablename__ = "notams"
-    airport = Column(String, nullable=False)          # Composite PK (part 1)
-    notam_number = Column(String, nullable=False)     # Composite PK (part 2)
+    airport = Column(String, nullable=False)
+    notam_number = Column(String, nullable=False)
     issue_time = Column(String)
     notam_info_type = Column(String)
     notam_category = Column(String)
@@ -29,7 +29,7 @@ class NotamRecord(Base):
     notam_summary = Column(Text)
     icao_message = Column(Text)
     replacing_notam = Column(Text)
-    raw_hash = Column(String, unique=True, index=True)   # Optional for content dedupe
+    raw_hash = Column(String, unique=True, index=True)
 
     __table_args__ = (
         PrimaryKeyConstraint('airport', 'notam_number'),

@@ -7,7 +7,7 @@ from analyze import analyze_notam
 from db import NotamRecord, SessionLocal, init_db
 import json
 
-async def build_and_populate_db():
+def build_and_populate_db():
     init_db()
     csv_path = "data/Airport Database - NOTAM ID.csv"
     all_notams = fetch_notam_data_from_csv(csv_path)
@@ -15,7 +15,7 @@ async def build_and_populate_db():
     to_analyze = []
     seen_in_run = set()  # NEW
 
-    for n in all_notams[:500]:
+    for n in all_notams:
         h = get_hash(n["notam_number"], n["icao_message"])
         print(f"NOTAM: {n['notam_number']}, Hash: {h}")  # <-- This line prints the hash
         if h in existing_hashes or h in seen_in_run:  # MODIFIED
@@ -31,7 +31,7 @@ async def build_and_populate_db():
     if not to_analyze:
         print("🎉 All NOTAMs already analyzed and stored. Exiting.")
     else:
-        await run_analysis(to_analyze, batch_size=800)
+        asyncio.run(run_analysis(to_analyze, batch_size=800))
 
 
 
@@ -181,6 +181,6 @@ if __name__ == "__main__":
     #     print("🎉 All NOTAMs already analyzed and stored. Exiting.")
     # else:
     #     asyncio.run(run_analysis(to_analyze, batch_size=800))
-    asyncio.run(build_and_populate_db())
+    build_and_populate_db()
 
 
