@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from notam.db import NotamRecord  # Don't import SessionLocal from db.py
+from notam.generate_briefing import briefing_chain
 import os
 
 print("🔥 MAIN.PY LOADED")
@@ -111,6 +112,6 @@ def get_all_notams(
 def root():
     return {"message": "✅ NOTAM API is running. Use /notams to query."}
 
-@app.get("/test")
-def test():
-    return {"message": "test is live"}
+@app.get("/briefing-from-input")
+async def get_briefing_from_input(query: str):
+    return await briefing_chain(query)

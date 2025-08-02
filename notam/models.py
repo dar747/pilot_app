@@ -23,3 +23,9 @@ class Notam_Analysis(BaseModel):
     notam_summary: str = Field(description="Brief human-readable summary of the NOTAM.")
     replacing_notam: str = Field(description="NOTAM number this notice replaces, or 'None' if not applicable.")
 
+class Notam_Briefing(BaseModel):
+    summary: str = Field(description="Detailed and personalized briefing of the NOTAM.")
+
+class Notam_Query_User_Input_Parser(BaseModel):
+    airport: str = Field(description="Interested Airport code.")
+    flight_scenario: str = Field(description="Flight scenario.")
