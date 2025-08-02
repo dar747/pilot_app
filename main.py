@@ -3,12 +3,12 @@ from typing import List, Optional
 from db import SessionLocal, NotamRecord
 from fastapi.middleware.cors import CORSMiddleware
 from db import DATABASE_URL  # Add this at the top
-
+import asyncio
 import os
 
 if not os.path.exists("notams.db"):
     from scheduler import build_and_populate_db
-    build_and_populate_db()
+    asyncio.run(build_and_populate_db())
 
 
 app = FastAPI(
