@@ -18,3 +18,4 @@ SQLAlchemy
 aiosqlite
 loguru
 python-dotenv
+psycopg2-binary
