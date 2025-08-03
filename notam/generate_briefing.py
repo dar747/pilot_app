@@ -4,6 +4,13 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import joinedload
+from notam.db import Airport
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from notam.models import Notam_Briefing, Notam_Query_User_Input_Parser
+from notam.db import NotamRecord
+from datetime import datetime
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_API_KEY"] = "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"
@@ -19,11 +26,7 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY is not set in environment.")
 
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from notam.models import Notam_Briefing, Notam_Query_User_Input_Parser
-from notam.db import NotamRecord
-from datetime import datetime
+
 
 llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=openai_api_key)
 
@@ -52,7 +55,9 @@ async def analyse_user_input(text:str)-> Optional[Notam_Query_User_Input_Parser]
 def get_notams_by_airport(airport: str, active_only=True):
     session = SessionLocal()
     try:
-        query = session.query(NotamRecord).filter(NotamRecord.airport == airport.upper())
+        query = session.query(NotamRecord).join(NotamRecord.airports).filter(
+            Airport.icao_code == airport.upper()
+        )
 
         if active_only:
             now = datetime.utcnow().isoformat()
@@ -60,6 +65,11 @@ def get_notams_by_airport(airport: str, active_only=True):
                 NotamRecord.start_time <= now,
                 NotamRecord.end_time >= now
             )
+        query = query.options(
+            joinedload(NotamRecord.airports),
+            joinedload(NotamRecord.operational_tags),
+            joinedload(NotamRecord.filter_tags)
+        )
 
         return query.all()
     finally:
