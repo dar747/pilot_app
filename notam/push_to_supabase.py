@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from notam.db import (
     Base, NotamRecord, Airport, OperationalTag, FilterTag,
-    notam_operational_tags, notam_filter_tags  # <-- Ensure both association tables are imported
+    notam_operational_tags, notam_filter_tags
 )
 
 load_dotenv()
@@ -22,6 +22,7 @@ supabase_engine = create_engine(SUPABASE_DB_URL)
 LocalSession = sessionmaker(bind=local_engine)
 SupabaseSession = sessionmaker(bind=supabase_engine)
 
+
 def get_local_notams():
     session = LocalSession()
     records = session.query(NotamRecord).options(
@@ -31,6 +32,7 @@ def get_local_notams():
     ).all()
     session.close()
     return records
+
 
 def get_supabase_hashes():
     session = SupabaseSession()
@@ -42,6 +44,7 @@ def get_supabase_hashes():
     finally:
         session.close()
     return hashes
+
 
 def clear_supabase():
     session = SupabaseSession()
@@ -56,6 +59,7 @@ def clear_supabase():
         print(f"❌ Failed to clear Supabase: {e}")
     finally:
         session.close()
+
 
 def push_to_supabase(overwrite=False):
     local_records = get_local_notams()
@@ -75,8 +79,17 @@ def push_to_supabase(overwrite=False):
     session = SupabaseSession()
 
     try:
+        # Preload tag and airport caches
+        existing_filter_tags = {tag.tag_name: tag for tag in session.query(FilterTag).all()}
+        existing_operational_tags = {tag.tag_name: tag for tag in session.query(OperationalTag).all()}
+        existing_airports = {a.icao_code: a for a in session.query(Airport).all()}
+
+        # Deduplication sets
+        operational_links = set()
+        filter_links = set()
+
         for record in records_to_push:
-            # Create new NOTAM record
+            # Create NOTAM object
             new = NotamRecord(
                 notam_number=record.notam_number,
                 issue_time=record.issue_time,
@@ -112,70 +125,56 @@ def push_to_supabase(overwrite=False):
                 raw_text=record.raw_text,
                 icao_message=record.icao_message
             )
-
             session.add(new)
-            session.flush()
+            session.flush()  # ✅ Ensures new.id is available
 
-            # 🔗 Airports
+            # Link airports
             for a in record.airports:
-                airport = session.query(Airport).filter_by(icao_code=a.icao_code).first()
+                airport = existing_airports.get(a.icao_code)
                 if not airport:
                     airport = Airport(icao_code=a.icao_code, name=a.name or f"{a.icao_code} Airport")
                     session.add(airport)
-                    session.flush()
+                    session.flush()  # ✅ Ensures airport.id is available
+                    existing_airports[a.icao_code] = airport
                 new.airports.append(airport)
 
-            # 🔗 Operational Tags (with airport_code)
+            # Link operational tags per airport
             for a in record.airports:
                 for t in record.operational_tags:
-                    tag = session.query(OperationalTag).filter_by(tag_name=t.tag_name).first()
+                    tag = existing_operational_tags.get(t.tag_name)
                     if not tag:
                         tag = OperationalTag(tag_name=t.tag_name, is_critical=t.is_critical)
                         session.add(tag)
-                        session.flush()
+                        session.flush()  # ✅ Ensures tag.id is available
+                        existing_operational_tags[t.tag_name] = tag
 
-                    exists = session.execute(
-                        select(notam_operational_tags).where(
-                            notam_operational_tags.c.notam_id == new.id,
-                            notam_operational_tags.c.tag_id == tag.id,
-                            notam_operational_tags.c.airport_code == a.icao_code
-                        )
-                    ).first()
+                    key = (new.id, tag.id, a.icao_code)
+                    if key not in operational_links:
+                        session.execute(insert(notam_operational_tags).values(
+                            notam_id=new.id,
+                            tag_id=tag.id,
+                            airport_code=a.icao_code
+                        ))
+                        operational_links.add(key)
 
-                    if not exists:
-                        session.execute(
-                            insert(notam_operational_tags).values(
-                                notam_id=new.id,
-                                tag_id=tag.id,
-                                airport_code=a.icao_code
-                            )
-                        )
-
-            # 🔗 Filter Tags (optional: if using airport_code)
+            # Link filter tags per airport
             for a in record.airports:
                 for t in record.filter_tags:
-                    tag = session.query(FilterTag).filter_by(tag_name=t.tag_name).first()
+                    tag = existing_filter_tags.get(t.tag_name)
                     if not tag:
                         tag = FilterTag(tag_name=t.tag_name)
                         session.add(tag)
-                        session.flush()
+                        session.flush()  # ✅ Ensures tag.id is available
+                        existing_filter_tags[t.tag_name] = tag
 
-                    exists = session.execute(
-                        select(notam_filter_tags).where(
-                            notam_filter_tags.c.notam_id == new.id,
-                            notam_filter_tags.c.tag_id == tag.id,
-                            notam_filter_tags.c.airport_code == a.icao_code
-                        )
-                    ).first()
-
-                    if not exists:
-                        session.execute(
-                            insert(notam_filter_tags).values(
-                                notam_id=new.id,
-                                tag_id=tag.id,
-                                airport_code=a.icao_code
-                            )
-                        )
+                    key = (new.id, tag.id, a.icao_code)
+                    if key not in filter_links:
+                        session.execute(insert(notam_filter_tags).values(
+                            notam_id=new.id,
+                            tag_id=tag.id,
+                            airport_code=a.icao_code
+                        ))
+                        filter_links.add(key)
 
         session.commit()
         print(f"✅ Successfully pushed {len(records_to_push)} NOTAMs to Supabase.")
@@ -189,5 +188,6 @@ def push_to_supabase(overwrite=False):
     finally:
         session.close()
 
+
 if __name__ == "__main__":
-    push_to_supabase(overwrite=True)  # Change to False for incremental sync
+    push_to_supabase()  # Change to False for incremental sync
