@@ -43,7 +43,7 @@ def build_and_populate_db(overwrite=False):
     to_analyze = []
     seen_in_run = set()  # NEW
 
-    for n in all_notams[:100]:
+    for n in all_notams:
         h = get_hash(n["notam_number"], n["icao_message"])
         print(f"NOTAM: {n['notam_number']}, Hash: {h}")  # <-- This line prints the hash
         if h in existing_hashes or h in seen_in_run:  # MODIFIED
@@ -64,7 +64,8 @@ def build_and_populate_db(overwrite=False):
 
 
 def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
-    df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=10)
+    #df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=10)
+    df = pd.read_csv(csv_path, usecols=['Designator', 'URL'])
     df = df.dropna(how='all', subset=['Designator', 'URL'])
     df = df[~(
         (df['Designator'].astype(str).str.strip() == '') &
@@ -470,7 +471,7 @@ def batch_save_notams(notam_results, airport_code):
 
 
 
-async def run_analysis(to_analyze: List[Dict], batch_size=200):
+async def run_analysis(to_analyze: List[Dict], batch_size=100):
     print(f"📦 Running analysis on {len(to_analyze)} new NOTAMs...")
     for i in range(0, len(to_analyze), batch_size):
         batch = to_analyze[i:i+batch_size]
