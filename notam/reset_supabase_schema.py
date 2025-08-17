@@ -1,8 +1,8 @@
 # reset_supabase_schema.py
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-from notam.db import Base  # import Base from your models
+from notam.db import Base
 
 load_dotenv()
 
@@ -13,11 +13,14 @@ if not SUPABASE_DB_URL:
 engine = create_engine(SUPABASE_DB_URL)
 
 def reset_supabase_schema():
-    print("⚠️ Dropping all tables in Supabase...")
-    Base.metadata.drop_all(bind=engine)
-    print("✅ All tables dropped.")
+    with engine.connect() as conn:
+        print("⚠️ Dropping ALL tables (CASCADE) in Supabase…")
+        conn.execute(text("DROP SCHEMA public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+        conn.commit()
+        print("✅ Schema dropped and recreated.")
 
-    print("📦 Recreating tables from SQLAlchemy models...")
+    print("📦 Recreating tables from SQLAlchemy models…")
     Base.metadata.create_all(bind=engine)
     print("✅ Tables recreated successfully.")
 

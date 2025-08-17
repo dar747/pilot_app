@@ -1,39 +1,77 @@
+# notam/scheduler.py
+import os
+import json
+import hashlib
+import asyncio
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple
+
 import pandas as pd
 import requests
-import asyncio
-import hashlib
-from typing import List, Dict
-
-from dotenv.main import rewrite
+from sqlalchemy.exc import IntegrityError
 
 from notam.analyze import analyze_notam
-from notam.db import NotamRecord, SessionLocal, init_db
+from notam.scoring import compute_base_score  # NEW: scoring
 from notam.db import (
-    NotamRecord, Airport, OperationalTag, FilterTag, NotamAcknowledgment,
-    SessionLocal, init_db, NotamHistory, notam_runways
+    init_db, SessionLocal,
+    # ORM models
+    NotamRecord, Airport, OperationalTag, NotamHistory,
+    NotamWingspanRestriction, NotamTaxiway, NotamProcedure, NotamObstacle,
+    NotamRunway, NotamRunwayCondition, NotamFlightPhase,
+    # Enums
+    SeverityLevelEnum, TimeClassificationEnum, TimeOfDayApplicabilityEnum,
+    FlightRuleApplicabilityEnum, AircraftSizeEnum, AircraftPropulsionEnum,
+    PrimaryCategoryEnum, NotamCategoryEnum, FlightPhaseEnum,
+    # M2M tables
+    notam_aircraft_propulsions, notam_aircraft_sizes,  # NEW: sizes was missing
 )
 
-import json
-from pathlib import Path
+# ----------------- helpers -----------------
 
-from datetime import datetime
-from sqlalchemy.exc import IntegrityError
-import json
-import hashlib
-import os
+def to_utc_aware(dt_like):
+    """str|datetime -> timezone-aware *UTC* datetime. Z/offset handled; naive assumed UTC."""
+    if isinstance(dt_like, str):
+        s = dt_like.strip()
+        if s.endswith(('Z', 'z')):
+            s = s[:-1] + '+00:00'
+        dt = datetime.fromisoformat(s)  # OK for '...+08:00'
+    elif isinstance(dt_like, datetime):
+        dt = dt_like
+    else:
+        raise TypeError(f"Unsupported datetime type: {type(dt_like)!r}")
 
-BASE_DIR = Path(__file__).resolve().parent.parent  # Goes up from notam/ to project root
+    if dt.tzinfo is None:                 # naive → assume UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)     # <-- normalize to UTC
 
+def parse_runway_id(runway_id: str) -> Tuple[Optional[int], Optional[str]]:
+    """'07L' -> (7,'L'); '18' -> (18, None)."""
+    if not runway_id:
+        return None, None
+    s = runway_id.strip().upper()
+    side = s[-1] if s[-1:] in {'L','C','R'} else None
+    if side:
+        s = s[:-1]
+    try:
+        num = int(s)
+        return (num, side) if 1 <= num <= 36 else (None, side)
+    except ValueError:
+        return None, side
 
-os.environ["LANGCHAIN_TRACING_V2"] = "false"
-os.environ["LANGCHAIN_API_KEY"] = "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"
-os.environ["LANGCHAIN_PROJECT"] = "PILOT"
+BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = "Analyse_NOTAM"
 
-def build_and_populate_db(overwrite=False):
+# ----------------- main pipeline -----------------
+
+def build_and_populate_db(overwrite: bool = False):
     init_db()
     csv_path = BASE_DIR / "data" / "Airport Database - NOTAM ID.csv"
     all_notams = fetch_notam_data_from_csv(str(csv_path))
+
     if overwrite:
         clear_db()
         existing_hashes = set()
@@ -41,31 +79,30 @@ def build_and_populate_db(overwrite=False):
         existing_hashes = get_existing_hashes()
 
     to_analyze = []
-    seen_in_run = set()  # NEW
+    seen_in_run = set()
 
-    for n in all_notams:
+    for n in all_notams[0:10]:  # keep your local cap; remove for full run
         h = get_hash(n["notam_number"], n["icao_message"])
-        print(f"NOTAM: {n['notam_number']}, Hash: {h}")  # <-- This line prints the hash
-        if h in existing_hashes or h in seen_in_run:  # MODIFIED
+        print(f"NOTAM: {n['notam_number']}, Hash: {h}")
+        if h in existing_hashes or h in seen_in_run:
             print(f"⏩ Already in DB or batch, skipping {n['notam_number']} | hash: {h}")
-        else:
-            n["raw_hash"] = h
-            to_analyze.append(n)
-            seen_in_run.add(h)  # NEW
-            print(f"🆕 Will analyze: {n['notam_number']} | hash: {h}")
+            continue
+        n["raw_hash"] = h
+        to_analyze.append(n)
+        seen_in_run.add(h)
+        print(f"🆕 Will analyze: {n['notam_number']} | hash: {h}")
 
     print(f"✅ {len(to_analyze)} new NOTAMs to analyze")
 
     if not to_analyze:
         print("🎉 All NOTAMs already analyzed and stored. Exiting.")
-    else:
-        asyncio.run(run_analysis(to_analyze, batch_size=800))
+        return
 
-
+    asyncio.run(run_analysis(to_analyze, batch_size=200, max_concurrency=8))
 
 def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
-    #df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=10)
-    df = pd.read_csv(csv_path, usecols=['Designator', 'URL'])
+    df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=10)
+    #df = pd.read_csv(csv_path, usecols=['Designator', 'URL']) # remove nrows for full
     df = df.dropna(how='all', subset=['Designator', 'URL'])
     df = df[~(
         (df['Designator'].astype(str).str.strip() == '') &
@@ -87,7 +124,7 @@ def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
             resp = requests.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-                timeout=10
+                timeout=20
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -101,7 +138,7 @@ def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
                             "notam_number": num.strip(),
                             "icao_message": msg.strip(),
                             "airport": designator,
-                            "url":url
+                            "url": url
                         })
                 print(f"✅ Stored {len(data.get('notams', []))} NOTAMs")
             else:
@@ -117,10 +154,12 @@ def get_hash(notam_number, icao_message):
 
 def get_existing_hashes():
     session = SessionLocal()
-    hashes = set(x[0] for x in session.query(NotamRecord.raw_hash).all() if x[0])
-    session.close()
-    print(f"🔎 DB contains {len(hashes)} existing NOTAM hashes.")
-    return hashes
+    try:
+        hashes = set(x[0] for x in session.query(NotamRecord.raw_hash).all() if x[0])
+        print(f"🔎 DB contains {len(hashes)} existing NOTAM hashes.")
+        return hashes
+    finally:
+        session.close()
 
 def clear_db():
     session = SessionLocal()
@@ -134,372 +173,255 @@ def clear_db():
     finally:
         session.close()
 
+# ----------------- persistence -----------------
 
-# def save_to_db(result, raw_text, notam_number, raw_hash, airport):
-#     session = SessionLocal()
-#     try:
-#         exists = session.query(NotamRecord).filter(
-#             (NotamRecord.airport == airport) &
-#             (NotamRecord.notam_number == notam_number)
-#         ).first()
-#
-#         if exists:
-#             print(f"⏩ Skipping duplicate NOTAM {notam_number} at {airport}")
-#             return
-#
-#         record = NotamRecord(
-#             airport=airport,
-#             notam_number=notam_number,
-#             issue_time=result.issue_time,
-#             notam_info_type=result.notam_info_type,
-#             notam_category=result.notam_category,
-#             start_time=result.start_time,
-#             end_time=result.end_time,
-#             seriousness=result.seriousness,
-#             applied_scenario=result.applied_scenario,
-#             applied_aircraft_type=result.applied_aircraft_type,
-#             operational_tag=",".join(result.operational_tag) if isinstance(result.operational_tag, list) else result.operational_tag,
-#             affected_runway=",".join(result.affected_runway) if isinstance(result.affected_runway, list) else result.affected_runway,
-#             notam_summary=result.notam_summary,
-#             icao_message=raw_text,
-#             replacing_notam=result.replacing_notam,
-#             raw_hash=raw_hash
-#         )
-#         session.add(record)
-#         session.commit()
-#         print(f"📝 Saved {result.notam_number} at {airport}")
-#     except Exception as e:
-#         session.rollback()
-#         print(f"❌ DB error: {e}")
-#     finally:
-#         session.close()
+def iso_utc_z(dt_like) -> str | None:
+    if dt_like is None:
+        return None
+    if isinstance(dt_like, str):
+        s = dt_like.strip()
+        # accept Z / offsets / naive
+        if s.endswith(('Z','z')):
+            s = s[:-1] + '+00:00'
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None  # or raise
+    elif isinstance(dt_like, datetime):
+        dt = dt_like
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-def save_to_db(result, raw_text, notam_number, raw_hash, airport):
+def _none_if_nullish(x):
+    return None if (x is None or (isinstance(x, str) and x.strip().upper() in {"", "NULL", "NONE"})) else x
+
+
+def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
     """
-    Save enhanced NOTAM analysis result to database with all relationships
+    Upsert a single analyzed NOTAM (by raw_hash).
     """
     session = SessionLocal()
     try:
-        # Check for existing NOTAM using unique constraint
-        exists = session.query(NotamRecord).filter(
-            NotamRecord.raw_hash == raw_hash
-        ).first()
-
-        if exists:
-            print(f"⏩ Updating existing NOTAM {notam_number}")
-            notam_record = exists
-            is_update = True
-        else:
-            notam_record = NotamRecord()
-            is_update = False
-
-        # Convert datetime strings to datetime objects
-        issue_time = datetime.fromisoformat(result.issue_time.replace('Z', '+00:00'))
-        start_time = datetime.fromisoformat(result.start_time.replace('Z', '+00:00'))
-        end_time = None
-        if result.end_time and result.end_time.lower() not in ['none', 'null', 'perm']:
-            try:
-                end_time = datetime.fromisoformat(result.end_time.replace('Z', '+00:00'))
-            except:
-                pass
-
-        # Basic fields
-        notam_record.notam_number = notam_number
-        notam_record.issue_time = issue_time
-        notam_record.notam_info_type = result.notam_info_type
-        notam_record.notam_category = result.notam_category
-
-        # Enhanced severity classification
-        notam_record.seriousness = result.seriousness  # Legacy field
-        notam_record.severity_level = result.severity_level
-        notam_record.urgency_indicator = result.urgency_indicator
-
-        # Temporal information
-        notam_record.start_time = start_time
-        notam_record.end_time = end_time
-        notam_record.time_classification = result.time_classification
-        notam_record.schedule = getattr(result, 'schedule', None)
-
-        # Applicability
-        notam_record.applied_scenario = result.applied_scenario
-        notam_record.applied_aircraft_type = result.applied_aircraft_type
-        notam_record.aircraft_categories = result.aircraft_categories
-        notam_record.flight_phases = result.flight_phases
-
-        # Categorization
-        notam_record.primary_category = result.primary_category
-        notam_record.secondary_categories = result.secondary_categories
-
-        # Location information
-        notam_record.affected_fir = getattr(result, 'affected_fir', None)
-        notam_record.affected_coordinate = getattr(result, 'affected_coordinate', None)
-
-        # Convert affected_area to dict if it exists
-        if hasattr(result, 'affected_area') and result.affected_area:
-            notam_record.affected_area = result.affected_area.dict()
-
-        # Content
-        notam_record.notam_summary = result.notam_summary
-        notam_record.icao_message = raw_text
-        notam_record.raw_text = getattr(result, 'raw_text', raw_text)
-
-        # Complex structures as JSON
-        if hasattr(result, 'extracted_elements'):
-            notam_record.extracted_elements = result.extracted_elements.dict()
-
-        if hasattr(result, 'operational_impact'):
-            notam_record.operational_impact = result.operational_impact.dict()
-
-        if hasattr(result, 'safety_assessment'):
-            notam_record.safety_assessment = result.safety_assessment.dict()
-
-        # Administrative
-        notam_record.replacing_notam = result.replacing_notam if result.replacing_notam != 'None' else None
-        notam_record.replaced_by = getattr(result, 'replaced_by', None)
-        notam_record.related_notams = getattr(result, 'related_notams', [])
-
-        # Multi-category support
-        notam_record.multi_category_rationale = getattr(result, 'multi_category_rationale', None)
-
-        # App-specific fields
-        notam_record.requires_acknowledgment = getattr(result, 'requires_acknowledgment', False)
-        notam_record.display_priority = result.display_priority
-
-        # Validation and quality
-        notam_record.confidence_score = result.confidence_score
-        notam_record.validation_warnings = getattr(result, 'validation_warnings', [])
-
-        # Tracking
-        notam_record.raw_hash = raw_hash
-
-        # Add to session if new
+        # Upsert by raw_hash (unique)
+        notam = session.query(NotamRecord).filter_by(raw_hash=raw_hash).first()
+        is_update = bool(notam)
         if not is_update:
-            session.add(notam_record)
-            session.flush()  # Get the ID for relationships
+            notam = NotamRecord(raw_hash=raw_hash)
 
-        # Handle airport relationships
-        # First, ensure the airport exists in the airports table
-        airport_record = session.query(Airport).filter_by(icao_code=airport).first()
-        if not airport_record:
-            airport_record = Airport(
-                icao_code=airport,
-                # You might want to fetch these from another source
-                name=f"{airport} Airport",
-            )
-            session.add(airport_record)
-            session.flush()
+        # Core fields / enums  (FIXED: all use Enum types)
+        notam.notam_number = notam_number
+        notam.issue_time = iso_utc_z(result.issue_time)
+        notam.notam_category = NotamCategoryEnum(result.notam_category.value)
+        notam.severity_level = SeverityLevelEnum(result.severity_level.value)
+        notam.start_time = iso_utc_z(result.start_time)
+        notam.end_time = iso_utc_z(_none_if_nullish(getattr(result, "end_time", None)))
+        notam.time_classification = (
+            TimeClassificationEnum(result.time_classification.value)
+            if getattr(result, "time_classification", None) else None
+        )
+        notam.time_of_day_applicability = TimeOfDayApplicabilityEnum(result.time_of_day_applicability.value)
+        notam.flight_rule_applicability = FlightRuleApplicabilityEnum(result.flight_rule_applicability.value)
+        notam.primary_category = PrimaryCategoryEnum(result.primary_category.value)  # FIXED typo
 
-        # Clear existing airport relationships if updating
+        notam.affected_area = result.affected_area.model_dump(exclude_none=True) if result.affected_area else None
+        notam.affected_airports_snapshot = result.affected_airports or []
+        notam.notam_summary = result.notam_summary
+        notam.icao_message = raw_text
+        notam.replacing_notam = result.replacing_notam or None
+
+        if not is_update:
+            session.add(notam)
+            session.flush()  # get notam.id
+
+        # Airports M2M
+        def get_or_create_airport(code: str) -> Airport:
+            ap = session.query(Airport).filter_by(icao_code=code).first()
+            if not ap:
+                ap = Airport(icao_code=code, name=f"{code} Airport")
+                session.add(ap); session.flush()
+            return ap
+
+        primary_ap = get_or_create_airport(airport_code)
         if is_update:
-            notam_record.airports = []
+            notam.airports.clear()
+        if primary_ap not in notam.airports:
+            notam.airports.append(primary_ap)
 
-        # Add primary airport
-        if airport_record not in notam_record.airports:
-            notam_record.airports.append(airport_record)
+        for icao in (result.affected_airports or []):
+            if icao and icao != airport_code:
+                ap = get_or_create_airport(icao)
+                if ap not in notam.airports:
+                    notam.airports.append(ap)
 
-        # Add any additional affected airports
-        if hasattr(result, 'affected_airports'):
-            for icao in result.affected_airports:
-                if icao != airport:  # Don't duplicate primary airport
-                    airport_rec = session.query(Airport).filter_by(icao_code=icao).first()
-                    if not airport_rec:
-                        airport_rec = Airport(icao_code=icao, name=f"{icao} Airport")
-                        session.add(airport_rec)
-                    if airport_rec not in notam_record.airports:
-                        notam_record.airports.append(airport_rec)
-
-        # Handle operational tags
+        # Operational tags
         if is_update:
-            notam_record.operational_tags = []
-
-        for tag_name in result.operational_tag:
+            notam.operational_tags.clear()
+        for tag_name in (result.operational_tag or []):
             tag = session.query(OperationalTag).filter_by(tag_name=tag_name).first()
             if not tag:
-                # Determine if tag is critical based on name
-                is_critical = any(critical in tag_name.lower() for critical in
-                                  ['closure', 'u/s', 'outage', 'failure', 'emergency'])
-                tag = OperationalTag(
-                    tag_name=tag_name,
-                    is_critical=is_critical
-                )
-                session.add(tag)
-                session.flush()
-            if tag not in notam_record.operational_tags:
-                notam_record.operational_tags.append(tag)
+                tag = OperationalTag(tag_name=tag_name)
+                session.add(tag); session.flush()
+            if tag not in notam.operational_tags:
+                notam.operational_tags.append(tag)
 
-        # Handle filter tags
-        if is_update:
-            notam_record.filter_tags = []
+        # Flight phases (as enums)
+        session.query(NotamFlightPhase).filter_by(notam_id=notam.id).delete()
+        for p in (result.flight_phases or []):
+            session.add(NotamFlightPhase(notam_id=notam.id, phase=FlightPhaseEnum(p.value)))
 
-        if hasattr(result, 'filter_tags'):
-            for tag_name in result.filter_tags:
-                tag = session.query(FilterTag).filter_by(tag_name=tag_name).first()
-                if not tag:
-                    tag = FilterTag(tag_name=tag_name)
-                    session.add(tag)
-                    session.flush()
-                if tag not in notam_record.filter_tags:
-                    notam_record.filter_tags.append(tag)
+        # Aircraft applicability
+        aa = result.aircraft_applicability
+        session.execute(notam_aircraft_sizes.delete().where(notam_aircraft_sizes.c.notam_id == notam.id))
+        session.execute(notam_aircraft_propulsions.delete().where(notam_aircraft_propulsions.c.notam_id == notam.id))
+        ws_old = session.query(NotamWingspanRestriction).filter_by(notam_id=notam.id).first()
+        if ws_old:
+            session.delete(ws_old)
 
-        # Handle runway relationships (stored in association table)
-        # First clear existing if updating
-        if is_update:
+        for s in (aa.sizes or []):
             session.execute(
-                notam_runways.delete().where(notam_runways.c.notam_id == notam_record.id)
+                notam_aircraft_sizes.insert().values(notam_id=notam.id, size=AircraftSizeEnum(s.value))
+            )
+        for pr in (aa.propulsion or []):
+            session.execute(
+                notam_aircraft_propulsions.insert().values(notam_id=notam.id, propulsion=AircraftPropulsionEnum(pr.value))
             )
 
-        # Add runway relationships
-        if result.affected_runway and result.affected_runway[0] != 'None':
-            for runway in result.affected_runway:
-                if runway and runway != 'None':
-                    session.execute(
-                        notam_runways.insert().values(
-                            notam_id=notam_record.id,
-                            runway_id=runway
-                        )
-                    )
+        ws = getattr(aa, "wingspan_restriction", None)
+        if ws and any(v is not None for v in (ws.min_m, ws.max_m)):
+            session.add(NotamWingspanRestriction(
+                notam_id=notam.id,
+                min_m=ws.min_m, min_inclusive=ws.min_inclusive,
+                max_m=ws.max_m, max_inclusive=ws.max_inclusive
+            ))
 
-        # Create history entry
-        if is_update:
-            history = NotamHistory(
-                notam_id=notam_record.id,
-                action='UPDATED',
-                changed_fields={'updated_at': datetime.utcnow().isoformat()}
-            )
-        else:
-            history = NotamHistory(
-                notam_id=notam_record.id,
-                action='CREATED',
-                changed_fields={}
-            )
-        session.add(history)
+        # Extracted elements
+        ee = getattr(result, "extracted_elements", None)
 
-        # Commit all changes
+        session.query(NotamTaxiway).filter_by(notam_id=notam.id).delete()
+        session.query(NotamProcedure).filter_by(notam_id=notam.id).delete()
+        if ee:
+            for t in (ee.taxiways or []):
+                if t:
+                    session.add(NotamTaxiway(
+                        notam_id=notam.id, airport_code=primary_ap.icao_code, taxiway_id=str(t).upper()
+                    ))
+            for pr in (ee.procedures or []):
+                if pr:
+                    session.add(NotamProcedure(
+                        notam_id=notam.id, airport_code=primary_ap.icao_code, procedure_name=str(pr).upper()
+                    ))
+
+        session.query(NotamObstacle).filter_by(notam_id=notam.id).delete()
+        if ee:
+            for o in (ee.obstacles or []):
+                rp = getattr(o, "runway_reference", None)
+                session.add(NotamObstacle(
+                    notam_id=notam.id,
+                    type=o.type,
+                    height_agl_ft=o.height_agl_ft,
+                    height_amsl_ft=o.height_amsl_ft,
+                    latitude=(o.location.latitude if o.location else None),
+                    longitude=(o.location.longitude if o.location else None),
+                    lighting=o.lighting,
+                    runway_id=(rp.runway_id if rp else None),
+                    reference_type=(rp.reference_type if rp else None),
+                    offset_distance_m=(rp.offset_distance_m if rp else None),
+                    offset_direction=(rp.offset_direction if rp else None),
+                    lateral_half_width_m=(rp.lateral_half_width_m if rp else None),
+                    corridor_orientation=(rp.corridor_orientation if rp else None),
+                ))
+
+        session.query(NotamRunway).filter_by(notam_id=notam.id, airport_code=primary_ap.icao_code).delete()
+        if ee:
+            for rwy in (ee.runways or []):
+                num, side = parse_runway_id(str(rwy))
+                if num is not None:
+                    session.add(NotamRunway(
+                        notam_id=notam.id,
+                        airport_code=primary_ap.icao_code,
+                        runway_number=num,
+                        runway_side=side
+                    ))
+
+        session.query(NotamRunwayCondition).filter_by(notam_id=notam.id).delete()
+        if ee:
+            for rc in (ee.runway_conditions or []):
+                num, side = parse_runway_id(rc.runway_id)
+                if num is not None:
+                    session.add(NotamRunwayCondition(
+                        notam_id=notam.id,
+                        airport_code=primary_ap.icao_code,
+                        runway_number=num,
+                        runway_side=side,
+                        friction_value=rc.friction_value
+                    ))
+
+        # Base score (NEW)
+        score, features, why = compute_base_score(notam)
+        notam.base_score = score
+        notam.score_features = features
+        notam.score_explanation = why
+
+        # History
+        session.add(NotamHistory(
+            notam_id=notam.id,
+            action=('UPDATED' if is_update else 'CREATED'),
+            changed_fields={'updated_at': datetime.now(timezone.utc).isoformat()} if is_update else {}
+        ))
+
         session.commit()
-
-        action = "Updated" if is_update else "Saved"
-        print(f"📝 {action} {result.notam_number} at {airport} with priority {result.display_priority}")
-
-        # Log tag associations
-        print(f"   - Operational tags: {', '.join(result.operational_tag)}")
-        if hasattr(result, 'filter_tags'):
-            print(f"   - Filter tags: {len(result.filter_tags)} tags")
-
-        return notam_record.id
+        print(f"📝 {'Updated' if is_update else 'Saved'} {notam_number} at {airport_code}")
+        return notam.id
 
     except IntegrityError as e:
-        session.rollback()
-        print(f"⚠️ Integrity error (possible duplicate): {e}")
-        # Try to update instead
-        return None
+        session.rollback(); print(f"⚠️ Integrity error: {e}"); return None
     except Exception as e:
-        session.rollback()
-        print(f"❌ DB error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        session.rollback(); import traceback; traceback.print_exc(); print(f"❌ DB error: {e}"); return None
     finally:
         session.close()
 
+# ----------------- batch/async orchestration -----------------
 
-def batch_save_notams(notam_results, airport_code):
-    """
-    Save multiple NOTAMs efficiently in a batch
-    """
-    session = SessionLocal()
-    saved_count = 0
-    updated_count = 0
-
-    try:
-        # Pre-fetch all airports and tags to avoid repeated queries
-        airport = session.query(Airport).filter_by(icao_code=airport_code).first()
-        if not airport:
-            airport = Airport(icao_code=airport_code, name=f"{airport_code} Airport")
-            session.add(airport)
-            session.flush()
-
-        # Process each NOTAM
-        for result, raw_text, notam_number, raw_hash in notam_results:
-            try:
-                # Similar logic as save_to_db but optimized for batch
-                exists = session.query(NotamRecord).filter(
-                    NotamRecord.notam_number == notam_number,
-                    NotamRecord.raw_hash == raw_hash
-                ).first()
-
-                if exists:
-                    updated_count += 1
-                    continue
-
-                # Create new record (similar to save_to_db logic)
-                # ... (implement batch-optimized version)
-
-                saved_count += 1
-
-            except Exception as e:
-                print(f"Error processing NOTAM {notam_number}: {e}")
-                continue
-
-        session.commit()
-        print(f"✅ Batch save complete: {saved_count} new, {updated_count} existing")
-
-    except Exception as e:
-        session.rollback()
-        print(f"❌ Batch save error: {e}")
-    finally:
-        session.close()
-
-#
-# def get_or_create_airport(session, icao_code, airport_data=None):
-#     """
-#     Helper function to get or create an airport record
-#     """
-#     airport = session.query(Airport).filter_by(icao_code=icao_code).first()
-#     if not airport:
-#         airport = Airport(
-#             icao_code=icao_code,
-#             name=airport_data.get('name', f"{icao_code} Airport") if airport_data else f"{icao_code} Airport",
-#             city=airport_data.get('city') if airport_data else None,
-#             country=airport_data.get('country') if airport_data else None,
-#             latitude=airport_data.get('latitude') if airport_data else None,
-#             longitude=airport_data.get('longitude') if airport_data else None,
-#             elevation_ft=airport_data.get('elevation_ft') if airport_data else None
-#         )
-#         session.add(airport)
-#         session.flush()
-#     return airport
-
-
-
-async def run_analysis(to_analyze: List[Dict], batch_size=100):
+async def run_analysis(to_analyze: List[Dict], batch_size=100, max_concurrency=8):
     print(f"📦 Running analysis on {len(to_analyze)} new NOTAMs...")
+
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def _analyze_one(n: Dict):
+        async with sem:
+            return await analyze_notam(n["icao_message"], n["issue_time"])
+
     for i in range(0, len(to_analyze), batch_size):
         batch = to_analyze[i:i+batch_size]
-        tasks = [analyze_notam(n["icao_message"],n["issue_time"]) for n in batch]
+        tasks = [_analyze_one(n) for n in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for j, result in enumerate(results):
             notam_number = batch[j]["notam_number"]
             icao_message = batch[j]["icao_message"]
             airport = batch[j].get("airport", "Unknown")
             url = batch[j].get("url", "Unknown")
+            raw_hash = batch[j].get("raw_hash", "Unknown")
+
             if isinstance(result, Exception) or result is None:
                 print(f"❌ Error analyzing NOTAM {notam_number}: {result}")
-            else:
-                print(f"\n--- ICAO Message for NOTAM {notam_number} ---\n{icao_message}\n")
-                print(f"🔗 Source URL: {url}")
-                print(f"📊 Analysis Result for {notam_number} ({airport}):\n{json.dumps(result.model_dump(), indent=2)}\n")
+                continue
 
-                save_to_db(
-                    result,
-                    icao_message,
-                    notam_number,
-                    batch[j]["raw_hash"],
-                    airport
-                )
+            print(f"\n--- ICAO Message for NOTAM {notam_number} ---\n{icao_message}\n")
+            print(f"🔗 Source URL: {url}")
+            print(f"📊 Analysis Result for {notam_number} ({airport}):\n{json.dumps(result.model_dump(), indent=2)}\n")
 
+            save_to_db(
+                result=result,
+                raw_text=icao_message,
+                notam_number=notam_number,
+                raw_hash=raw_hash,
+                airport_code=airport
+            )
+
+# ----------------- entrypoint -----------------
 
 if __name__ == "__main__":
-    build_and_populate_db()
-
-
-
+    build_and_populate_db(overwrite=True)
