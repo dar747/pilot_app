@@ -1,336 +1,493 @@
-import os
-from sqlalchemy import create_engine, Column, String, Integer, Text, PrimaryKeyConstraint
-from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
-from sqlalchemy import (
-    Column, String, Integer, Float, Boolean, Text, DateTime,
-    ForeignKey, Table, JSON, Index, UniqueConstraint, Enum
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
+# notam/db.py
+from __future__ import annotations
+
 import enum
+import os
+from contextlib import contextmanager
+from typing import Optional
+
+from sqlalchemy import (
+    create_engine, Column, String, Integer, Float, Boolean, Text, DateTime,
+    ForeignKey, Table, JSON, Index, UniqueConstraint, Enum, CheckConstraint,
+    SmallInteger, ForeignKeyConstraint
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.sql import func
+from sqlalchemy import event
 
 
+# ---------------------------------------------------------------------------
+# Engine & Session
+# ---------------------------------------------------------------------------
 
+# Example: "postgresql+psycopg2://user:pass@localhost:5432/notamdb"
+DATABASE_URL = os.getenv("LOCAL_DB_URL", "sqlite:///./notam.db")
 
-# Load environment variables
-load_dotenv()
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+)
+if DATABASE_URL.startswith("postgresql"):
+    @event.listens_for(engine, "connect")
+    def set_sql_timezone(dbapi_connection, _):
+        with dbapi_connection.cursor() as cur:
+            cur.execute("SET TIME ZONE 'UTC'")
 
-DATABASE_URL = os.getenv("LOCAL_DB_URL")  # Read from .env file
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
-
-def init_db():
-    Base.metadata.create_all(bind=engine)
-
-
+SessionLocal = sessionmaker(bind=engine, future=True)
 Base = declarative_base()
 
 
-# Enums for database
-class SeverityLevelEnum(enum.Enum):
+@contextmanager
+def get_session():
+    """Small helper so you can do: with get_session() as s: ..."""
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class NotamCategoryEnum(str, enum.Enum):
+    FIR = "FIR"
+    AIRPORT = "AIRPORT"
+
+class SeverityLevelEnum(str, enum.Enum):
     CRITICAL = "CRITICAL"
     OPERATIONAL = "OPERATIONAL"
     ADVISORY = "ADVISORY"
 
-
-class UrgencyIndicatorEnum(enum.Enum):
-    IMMEDIATE = "IMMEDIATE"
-    URGENT = "URGENT"
-    ROUTINE = "ROUTINE"
-    PLANNED = "PLANNED"
-
-
-class TimeClassificationEnum(enum.Enum):
+class TimeClassificationEnum(str, enum.Enum):
     PERMANENT = "PERMANENT"
     LONG_TERM = "LONG_TERM"
     MEDIUM_TERM = "MEDIUM_TERM"
     SHORT_TERM = "SHORT_TERM"
     DAILY = "DAILY"
+    WEEKLY = "WEEKLY"
+    MONTHLY = "MONTHLY"
     EVENT_SPECIFIC = "EVENT_SPECIFIC"
 
+class TimeOfDayApplicabilityEnum(str, enum.Enum):
+    DAY = "DAY ONLY"
+    NIGHT = "NIGHT ONLY"
+    ALL = "ALL TIMES"
 
-# Association tables for many-to-many relationships
-notam_airports = Table('notam_airports', Base.metadata,
-                       Column('notam_id', Integer, ForeignKey('notams.id'), primary_key=True),
-                       Column('airport_code', String(4), ForeignKey('airports.icao_code'), primary_key=True),
-                       Index('idx_notam_airports', 'notam_id', 'airport_code')
-                       )
+class FlightRuleApplicabilityEnum(str, enum.Enum):
+    VFR_ONLY = "VFR ONLY"
+    IFR_ONLY = "IFR ONLY"
+    ALL = "ALL RULES"
 
-notam_runways = Table(
-    'notam_runways',
+class AircraftSizeEnum(str, enum.Enum):
+    ALL = "ALL"
+    LIGHT = "LIGHT"
+    MEDIUM = "MEDIUM"
+    HEAVY = "HEAVY"
+    SUPER = "SUPER"
+
+class AircraftPropulsionEnum(str, enum.Enum):
+    ALL = "ALL"
+    JET = "JET"
+    TURBOPROP = "TURBOPROP"
+    PISTON = "PISTON"
+    HELICOPTER = "HELICOPTER"
+
+class FlightPhaseEnum(str, enum.Enum):
+    PREFLIGHT = "PREFLIGHT"
+    TAXI = "TAXI"
+    TAKEOFF = "TAKEOFF"
+    DEPARTURE = "DEPARTURE"
+    CRUISE = "CRUISE"
+    APPROACH = "APPROACH"
+    ARRIVAL = "ARRIVAL"
+    GROUND_OPS = "GROUND_OPS"
+    ALL_PHASES = "ALL_PHASES"
+
+class PrimaryCategoryEnum(str, enum.Enum):
+    RUNWAY_OPERATIONS = "RUNWAY_OPERATIONS"
+    AERODROME_OPERATIONS = "AERODROME_OPERATIONS"
+    NAVAIDS_SID_STAR_APPROACH_PROCEDURES = "NAVAIDS_SID_STAR_APPROACH_PROCEDURES"
+    FLOW_CONTROL = "FLOW_CONTROL"
+    COMMUNICATION_SERVICES = "COMMUNICATION_SERVICES"
+    OBSTACLES = "OBSTACLES"
+
+
+# ---------------------------------------------------------------------------
+# Association (pure many-to-many) Tables
+# ---------------------------------------------------------------------------
+
+notam_airports = Table(
+    "notam_airports",
     Base.metadata,
-    Column('notam_id', Integer, ForeignKey('notams.id'), primary_key=True),
-    Column('airport_code', String(4), ForeignKey('airports.icao_code'), primary_key=True),
-    Column('runway_id', String(7), primary_key=True),  # e.g., "09L/27R"
-    Index('idx_notam_runways', 'notam_id', 'airport_code', 'runway_id')
+    Column("notam_id", Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True),
+    Column("airport_code", String(4), ForeignKey("airports.icao_code", ondelete="CASCADE"), primary_key=True),
+    Index("ix_notam_airports_airport_first", "airport_code", "notam_id"),
 )
 
+notam_operational_tags = Table(
+    "notam_operational_tags",
+    Base.metadata,
+    Column("notam_id", Integer, ForeignKey("notams.id", ondelete="CASCADE"), nullable=False),
+    Column("tag_id", Integer, ForeignKey("operational_tags.id", ondelete="CASCADE"), nullable=False),
+    UniqueConstraint("notam_id", "tag_id", name="uq_notam_operational_tags"),
+    Index("ix_notam_operational_tags_tag_first", "tag_id", "notam_id"),
+)
 
-notam_operational_tags = Table('notam_operational_tags', Base.metadata,
-                               Column('notam_id', Integer, ForeignKey('notams.id'), primary_key=True),
-                                     Column('airport_code', String(4), ForeignKey('airports.icao_code'), primary_key=True),
-                               Column('tag_id', Integer, ForeignKey('operational_tags.id'), primary_key=True),
+notam_aircraft_sizes = Table(
+    "notam_aircraft_sizes",
+    Base.metadata,
+    Column("notam_id", Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True),
+    Column("size", Enum(AircraftSizeEnum, native_enum=False), primary_key=True),
+    Index("ix_aircraft_sizes_size_first", "size", "notam_id"),
+)
+# Map a class to the existing association table (no schema duplication)
+class NotamAircraftSizeLink(Base):
+    __table__ = notam_aircraft_sizes  # reuse the Table you already defined
 
-                               Index('idx_notam_tags', 'notam_id', 'tag_id')
-                               )
-
-notam_filter_tags = Table('notam_filter_tags', Base.metadata,
-                          Column('notam_id', Integer, ForeignKey('notams.id'), primary_key=True),
-                          Column('airport_code', String(4), ForeignKey('airports.icao_code'), primary_key=True),
-                          Column('tag_id', Integer, ForeignKey('filter_tags.id'), primary_key=True),
-                          Index('idx_notam_filter_tags', 'notam_id', 'tag_id')
-                          )
-
+    # optional relationship back to NotamRecord for convenient access
+    notam = relationship("NotamRecord", back_populates="aircraft_size_links", viewonly=True)
 
 
-# Main NOTAM table
+notam_aircraft_propulsions = Table(
+    "notam_aircraft_propulsions",
+    Base.metadata,
+    Column("notam_id", Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True),
+    Column("propulsion", Enum(AircraftPropulsionEnum, native_enum=False), primary_key=True),
+    Index("ix_aircraft_propulsions_prop_first", "propulsion", "notam_id"),
+)
+
+# Map a class to the existing propulsion association table (no schema duplication)
+class NotamAircraftPropulsionLink(Base):
+    __table__ = notam_aircraft_propulsions  # reuse the Table you already defined
+
+    # optional relationship back to NotamRecord for convenient access
+    notam = relationship("NotamRecord", back_populates="aircraft_propulsion_links", viewonly=True)
+
+
+# ---------------------------------------------------------------------------
+# Child (normalized) Tables
+# ---------------------------------------------------------------------------
+
+class NotamFlightPhase(Base):
+    __tablename__ = "notam_flight_phases"
+
+    notam_id = Column(Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True)
+    phase = Column(Enum(FlightPhaseEnum, native_enum=False), primary_key=True)
+
+    __table_args__ = (
+        Index("ix_phase_first", "phase", "notam_id"),
+    )
+
+    notam = relationship("NotamRecord", back_populates="flight_phase_links", passive_deletes=True)
+
+
+class NotamWingspanRestriction(Base):
+    __tablename__ = "notam_wingspan_restrictions"
+
+    notam_id = Column(Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True)
+    min_m = Column(Float)
+    min_inclusive = Column(Boolean, default=True, nullable=False)
+    max_m = Column(Float)
+    max_inclusive = Column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("(min_m IS NULL OR min_m >= 0)", name="chk_wspan_min_nonneg"),
+        CheckConstraint("(max_m IS NULL OR max_m >= 0)", name="chk_wspan_max_nonneg"),
+        CheckConstraint(
+            "(min_m IS NULL OR max_m IS NULL OR min_m <= max_m)",
+            name="chk_wspan_min_le_max"
+        ),
+        Index("ix_wspan_min_max", "min_m", "max_m"),
+    )
+
+    notam = relationship(
+        "NotamRecord",
+        back_populates="wingspan_restriction",
+        passive_deletes=True,
+        uselist=False
+    )
+
+
+class NotamTaxiway(Base):
+    __tablename__ = "notam_taxiways"
+
+    notam_id = Column(Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True)
+    airport_code = Column(String(4), ForeignKey("airports.icao_code", ondelete="CASCADE"), primary_key=True)
+    taxiway_id = Column(String(16), primary_key=True)
+
+    __table_args__ = (
+        # If you're on Postgres and want a format check, you can add:
+        # CheckConstraint("taxiway_id ~ '^[A-Z]{1,3}[0-9]{0,2}$'", name="chk_twy_format"),
+        Index("ix_twy_airport_id", "airport_code", "taxiway_id", "notam_id"),
+        Index("ix_twy_notam_first", "notam_id", "airport_code", "taxiway_id"),
+    )
+
+    notam = relationship("NotamRecord", back_populates="taxiways", passive_deletes=True)
+
+
+class NotamProcedure(Base):
+    __tablename__ = "notam_procedures"
+
+    notam_id = Column(Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True)
+    airport_code = Column(String(4), ForeignKey("airports.icao_code", ondelete="CASCADE"), primary_key=True)
+    procedure_name = Column(String(200), primary_key=True)
+
+    __table_args__ = (
+        Index("ix_proc_airport_name", "airport_code", "procedure_name", "notam_id"),
+        Index("ix_proc_notam_first", "notam_id", "airport_code", "procedure_name"),
+    )
+
+    notam = relationship("NotamRecord", back_populates="procedures", passive_deletes=True)
+
+
+class NotamObstacle(Base):
+    __tablename__ = "notam_obstacles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notam_id = Column(Integer, ForeignKey('notams.id', ondelete="CASCADE"), index=True, nullable=False)
+    type = Column(String(128), nullable=False)
+    height_agl_ft = Column(Integer, nullable=False)
+    height_amsl_ft = Column(Integer)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    lighting = Column(String(32), nullable=False)
+    runway_id = Column(String(7))
+    reference_type = Column(String(128))
+    offset_distance_m = Column(Float)
+    offset_direction = Column(String(120))
+    lateral_half_width_m = Column(Float)
+    corridor_orientation = Column(String(32))
+
+
+class NotamRunway(Base):
+    __tablename__ = "notam_runways"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notam_id = Column(Integer, ForeignKey("notams.id", ondelete="CASCADE"), nullable=False, index=True)
+    airport_code = Column(String(4), ForeignKey("airports.icao_code", ondelete="CASCADE"), nullable=False)
+    runway_number = Column(SmallInteger, nullable=False)     # 1..36
+    runway_side = Column(String(1), nullable=True)           # L/C/R or NULL
+
+    __table_args__ = (
+        CheckConstraint("runway_number BETWEEN 1 AND 36", name="chk_runway_number"),
+        CheckConstraint("runway_side IN ('L','C','R') OR runway_side IS NULL", name="chk_runway_side"),
+        UniqueConstraint("notam_id", "airport_code", "runway_number", "runway_side", name="uq_notam_runway_unique"),
+        Index("ix_nr_airport_runway", "airport_code", "runway_number", "runway_side", "notam_id"),
+    )
+
+    notam = relationship("NotamRecord", back_populates="runways", passive_deletes=True)
+
+
+class NotamRunwayCondition(Base):
+    __tablename__ = "notam_runway_conditions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notam_id = Column(Integer, ForeignKey('notams.id', ondelete="CASCADE"), nullable=False)
+    airport_code = Column(String(4), nullable=False)
+    runway_number = Column(SmallInteger, nullable=False)
+    runway_side = Column(String(1), nullable=True)
+    friction_value = Column(Integer)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ['notam_id', 'airport_code', 'runway_number', 'runway_side'],
+            ['notam_runways.notam_id', 'notam_runways.airport_code', 'notam_runways.runway_number', 'notam_runways.runway_side'],
+            ondelete="CASCADE"
+        ),
+        CheckConstraint("runway_side IN ('L','C','R') OR runway_side IS NULL", name="chk_nrc_runway_side"),
+        Index('ix_nrc_airport_runway', 'airport_code', 'runway_number', 'runway_side'),
+        Index('ix_nrc_airport_friction', 'airport_code', 'friction_value', 'notam_id'),
+    )
+
+    notam = relationship("NotamRecord", back_populates="runway_conditions", passive_deletes=True)
+
+
+# ---------------------------------------------------------------------------
+# Main NOTAM + Lookups
+# ---------------------------------------------------------------------------
+
 class NotamRecord(Base):
     __tablename__ = "notams"
 
-    # Primary key
     id = Column(Integer, primary_key=True, autoincrement=True)
 
-    # Basic Information (maintaining compatibility)
+    # Basic
     notam_number = Column(String(50), nullable=False, index=True)
-    issue_time = Column(DateTime, nullable=False)
-    notam_info_type = Column(String(10))  # Q-code
-    notam_category = Column(String(20))  # FIR or Airport
+    issue_time = Column(String, nullable=False)
 
-    # Enhanced Severity Classification
-    seriousness = Column(Integer)  # Legacy 1-3
-    severity_level = Column(Enum(SeverityLevelEnum), nullable=False, index=True)
-    urgency_indicator = Column(Enum(UrgencyIndicatorEnum), nullable=False)
+    notam_category = Column(Enum(NotamCategoryEnum, native_enum=False), nullable=False, index=True)
+    severity_level = Column(Enum(SeverityLevelEnum, native_enum=False), nullable=False, index=True)
 
-    # Temporal Information
-    start_time = Column(DateTime, nullable=False, index=True)
-    end_time = Column(DateTime, index=True)  # Nullable for permanent
-    time_classification = Column(Enum(TimeClassificationEnum), nullable=True)
-    schedule = Column(Text)  # Daily/weekly schedule if applicable
+    # Temporal
+    start_time = Column(String, nullable=False, index=True)
+    end_time = Column(String, index=True)
+    time_classification = Column(Enum(TimeClassificationEnum, native_enum=False))
 
     # Applicability
-    applied_scenario = Column(String(20))  # Legacy field
-    applied_aircraft_type = Column(String(20))  # Legacy field
-    aircraft_categories = Column(JSON)  # List stored as JSON
-    flight_phases = Column(JSON)  # List stored as JSON
+    time_of_day_applicability = Column(Enum(TimeOfDayApplicabilityEnum, native_enum=False))
+    flight_rule_applicability = Column(Enum(FlightRuleApplicabilityEnum, native_enum=False))
 
-    # Categorization
-    primary_category = Column(String(100), index=True)
-    secondary_categories = Column(JSON)  # List stored as JSON
+    # Single primary category
+    primary_category = Column(Enum(PrimaryCategoryEnum, native_enum=False), nullable=False, index=True)
 
-    # Location Information (normalized)
-    affected_fir = Column(String(10))
-    affected_coordinate = Column(String(100))  # Legacy field
-    affected_area = Column(JSON)  # Complex structure as JSON
+    # Location / Area
+    affected_area = Column(JSON)                      # keep JSON for geometry
+    affected_airports_snapshot = Column(JSON)         # quick snapshot list
 
     # Content
     notam_summary = Column(Text, nullable=False)
-    icao_message = Column(Text)  # Original NOTAM text
-    raw_text = Column(Text)
-
-    # Infrastructure Impact (JSON for complex structures)
-    extracted_elements = Column(JSON)  # All extracted technical elements
-
-    # Operational Analysis (JSON for complex structures)
-    operational_impact = Column(JSON)
-    safety_assessment = Column(JSON)
+    icao_message = Column(Text)
 
     # Administrative
     replacing_notam = Column(String(50), index=True)
-    replaced_by = Column(String(50))
-    related_notams = Column(JSON)  # List of related NOTAM numbers
+    raw_hash = Column(String(64), unique=True, index=True)
 
-    # Multi-category Support
-    multi_category_rationale = Column(Text)
+    # Scoring (server-side base score; client will reweight)
+    base_score = Column(SmallInteger)                 # 0..100
+    score_features = Column(JSON)                     # dict of raw features
+    score_explanation = Column(String(400))           # short reason
 
-    # App-specific Fields
-    requires_acknowledgment = Column(Boolean, default=False, index=True)
-    display_priority = Column(Integer, nullable=False, index=True)
-
-    # Validation and Quality
-    confidence_score = Column(Float)
-    validation_warnings = Column(JSON)  # List stored as JSON
-
-    # Tracking
-    raw_hash = Column(String(64), unique=True, index=True)  # For deduplication
-    created_at = Column(DateTime, default=func.now(), nullable=False)
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-    last_validated = Column(DateTime)
-
-    # Status
-    is_active = Column(Boolean, default=True, index=True)
-    is_cancelled = Column(Boolean, default=False)
-    cancelled_by = Column(String(50))  # NOTAM number that cancelled this
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     # Relationships
     airports = relationship("Airport", secondary=notam_airports, back_populates="notams")
-    operational_tags = relationship("OperationalTag", secondary=notam_operational_tags, back_populates="notams")
-    filter_tags = relationship("FilterTag", secondary=notam_filter_tags, back_populates="notams")
-    acknowledgments = relationship("NotamAcknowledgment", back_populates="notam")
+    operational_tags = relationship("OperationalTag", secondary=notam_operational_tags, back_populates="notams", passive_deletes=True)
 
-    # Indexes
+    wingspan_restriction = relationship("NotamWingspanRestriction", uselist=False, back_populates="notam", cascade="all, delete-orphan")
+    taxiways = relationship("NotamTaxiway", cascade="all, delete-orphan")
+    procedures = relationship("NotamProcedure", cascade="all, delete-orphan")
+    obstacles = relationship("NotamObstacle", cascade="all, delete-orphan")
+    runway_conditions = relationship("NotamRunwayCondition", back_populates="notam", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
+    flight_phase_links = relationship("NotamFlightPhase", cascade="all, delete-orphan", back_populates="notam", lazy="selectin")
+    runways = relationship("NotamRunway", back_populates="notam", cascade="all, delete-orphan", passive_deletes=True, lazy="selectin")
+    aircraft_size_links = relationship(
+        "NotamAircraftSizeLink",
+        cascade="all, delete-orphan",
+        primaryjoin="NotamRecord.id==NotamAircraftSizeLink.notam_id",
+        lazy="selectin",
+        viewonly=False,
+    )
+
+    @property
+    def aircraft_sizes(self):
+        return [link.size for link in self.aircraft_size_links]
+
+    # --- propulsions (mirror of sizes) ---
+    aircraft_propulsion_links = relationship(
+        "NotamAircraftPropulsionLink",
+        cascade="all, delete-orphan",
+        primaryjoin="NotamRecord.id==NotamAircraftPropulsionLink.notam_id",
+        lazy="selectin",
+        viewonly=False,
+    )
+
+    @property
+    def aircraft_propulsions(self):
+        return [link.propulsion for link in self.aircraft_propulsion_links]
+
+
     __table_args__ = (
         Index('idx_notam_times', 'start_time', 'end_time'),
-        Index('idx_notam_active', 'is_active', 'start_time', 'end_time'),
-        Index('idx_notam_severity_priority', 'severity_level', 'display_priority'),
         UniqueConstraint('notam_number', 'issue_time', name='uq_notam_number_issue'),
     )
 
 
-# Airport reference table
+# in notam/db.py
+
 class Airport(Base):
     __tablename__ = "airports"
 
+    # Use ICAO as the natural PK — simpler with your current schema
     icao_code = Column(String(4), primary_key=True)
-    iata_code = Column(String(3))
-    name = Column(String(200))
-    city = Column(String(100))
-    country = Column(String(100))
-    latitude = Column(Float)
-    longitude = Column(Float)
-    elevation_ft = Column(Integer)
 
-    # Relationships
+    # Your requested fields (all nullable; fill gradually)
+    iata_code = Column(String(3))
+    faa_id = Column(String(10))
+    name = Column(String(200))
+    country = Column(String(100))
+
+    # keep your exact column names
+    lat = Column(Float)
+    lon = Column(Float)
+    elev = Column(Integer)
+
+    freqs = Column(JSON)                    # optional raw JSON from feed
+    timezone = Column(String(64))           # e.g., "Asia/Hong_Kong"
+    utc_offset_normal = Column(Float)       # hours
+    utc_offset_dst = Column(Float)          # hours
+    changetodst = Column(DateTime(timezone=True))
+    changefromdst = Column(DateTime(timezone=True))
+
+    # if your API gives "2.5E"/"1.3W" strings, store as String;
+    # if you prefer numeric, switch to Float and parse to +E/-W
+    magnetic_declination = Column(String(16))
+
+    # relationships (unchanged)
     notams = relationship("NotamRecord", secondary=notam_airports, back_populates="airports")
 
-    # Index
     __table_args__ = (
-        Index('idx_airport_location', 'latitude', 'longitude'),
+        Index('idx_airport_location', 'lat', 'lon'),
+        Index('idx_airport_country', 'country'),
+        Index('idx_airport_iata', 'iata_code'),
     )
 
 
-# Operational Tags lookup table
+
 class OperationalTag(Base):
     __tablename__ = "operational_tags"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     tag_name = Column(String(100), unique=True, nullable=False)
-    category = Column(String(50))  # Tag category for grouping
-    description = Column(Text)
-    is_critical = Column(Boolean, default=False)
 
-    # Relationships
-    notams = relationship("NotamRecord", secondary=notam_operational_tags, back_populates="operational_tags")
+    notams = relationship("NotamRecord", secondary=notam_operational_tags, back_populates="operational_tags", passive_deletes=True)
 
 
-# Filter Tags lookup table
-class FilterTag(Base):
-    __tablename__ = "filter_tags"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    tag_name = Column(String(100), unique=True, nullable=False)
-    tag_category = Column(String(50))  # For UI grouping
-    display_order = Column(Integer)
-    is_default = Column(Boolean, default=False)  # Default tags for new users
-
-    # Relationships
-    notams = relationship("NotamRecord", secondary=notam_filter_tags, back_populates="filter_tags")
-
-
-# User acknowledgments tracking
-class NotamAcknowledgment(Base):
-    __tablename__ = "notam_acknowledgments"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    notam_id = Column(Integer, ForeignKey('notams.id'), nullable=False)
-    user_id = Column(String(100), nullable=False)  # Your user ID system
-    acknowledged_at = Column(DateTime, default=func.now())
-    flight_number = Column(String(20))  # Optional flight association
-
-    # Relationships
-    notam = relationship("NotamRecord", back_populates="acknowledgments")
-
-    # Index
-    __table_args__ = (
-        Index('idx_ack_user_notam', 'user_id', 'notam_id'),
-        UniqueConstraint('notam_id', 'user_id', 'flight_number', name='uq_user_notam_flight'),
-    )
-
-
-# User saved filters
-class SavedFilter(Base):
-    __tablename__ = "saved_filters"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(100), nullable=False, index=True)
-    filter_name = Column(String(100), nullable=False)
-    filter_config = Column(JSON)  # Stores complete filter configuration
-    is_default = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-
-    __table_args__ = (
-        UniqueConstraint('user_id', 'filter_name', name='uq_user_filter_name'),
-    )
-
-
-# NOTAM history tracking
 class NotamHistory(Base):
     __tablename__ = "notam_history"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    notam_id = Column(Integer, ForeignKey('notams.id'), nullable=False)
+    notam_id = Column(Integer, ForeignKey('notams.id', ondelete="CASCADE"), nullable=False)
     action = Column(String(20))  # CREATED, UPDATED, CANCELLED, REPLACED
-    changed_fields = Column(JSON)  # What changed
-    timestamp = Column(DateTime, default=func.now())
+    changed_fields = Column(JSON)
+    timestamp = Column(DateTime(timezone=True), default=func.now())
 
-    # Index
     __table_args__ = (
         Index('idx_history_notam_time', 'notam_id', 'timestamp'),
     )
 
-#
-# # Helper functions for database operations
-# def create_or_update_notam(session, notam_data, extracted_tags):
-#     """
-#     Create or update a NOTAM record with all relationships
-#     """
-#     # Check if NOTAM exists
-#     existing = session.query(NotamRecord).filter_by(
-#         notam_number=notam_data['notam_number'],
-#         issue_time=notam_data['issue_time']
-#     ).first()
-#
-#     if existing:
-#         # Update existing record
-#         for key, value in notam_data.items():
-#             if hasattr(existing, key):
-#                 setattr(existing, key, value)
-#         notam = existing
-#     else:
-#         # Create new record
-#         notam = NotamRecord(**notam_data)
-#         session.add(notam)
-#
-#     # Handle airport relationships
-#     if 'affected_airports' in extracted_tags:
-#         notam.airports = []
-#         for icao in extracted_tags['affected_airports']:
-#             airport = session.query(Airport).filter_by(icao_code=icao).first()
-#             if airport:
-#                 notam.airports.append(airport)
-#
-#     # Handle operational tags
-#     if 'operational_tags' in extracted_tags:
-#         notam.operational_tags = []
-#         for tag_name in extracted_tags['operational_tags']:
-#             tag = session.query(OperationalTag).filter_by(tag_name=tag_name).first()
-#             if not tag:
-#                 tag = OperationalTag(tag_name=tag_name)
-#                 session.add(tag)
-#             notam.operational_tags.append(tag)
-#
-#     # Handle filter tags
-#     if 'filter_tags' in extracted_tags:
-#         notam.filter_tags = []
-#         for tag_name in extracted_tags['filter_tags']:
-#             tag = session.query(FilterTag).filter_by(tag_name=tag_name).first()
-#             if not tag:
-#                 tag = FilterTag(tag_name=tag_name)
-#                 session.add(tag)
-#             notam.filter_tags.append(tag)
-#
-#     session.commit()
-#     return notam
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def init_db() -> None:
+    """Create all tables that don't exist yet."""
+    Base.metadata.create_all(bind=engine)
+
+
+__all__ = [
+    # session
+    "engine", "SessionLocal", "Base", "get_session", "init_db",
+    # enums
+    "NotamCategoryEnum", "SeverityLevelEnum", "TimeClassificationEnum",
+    "TimeOfDayApplicabilityEnum", "FlightRuleApplicabilityEnum",
+    "AircraftSizeEnum", "AircraftPropulsionEnum", "FlightPhaseEnum", "PrimaryCategoryEnum",
+    # association tables
+    "notam_airports", "notam_operational_tags", "notam_aircraft_sizes", "notam_aircraft_propulsions",
+    # link classes (NEW)
+    "NotamAircraftSizeLink", "NotamAircraftPropulsionLink",
+    # models
+    "NotamRecord", "Airport", "OperationalTag", "NotamHistory",
+    "NotamWingspanRestriction", "NotamTaxiway", "NotamProcedure", "NotamObstacle",
+    "NotamRunway", "NotamRunwayCondition", "NotamFlightPhase",
+
+]

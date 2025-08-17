@@ -21,3 +21,4 @@ python-dotenv
 psycopg2-binary
 aiohttp>=3.9.0
 langsmith
+alembic>=1.13.1
