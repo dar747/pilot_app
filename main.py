@@ -22,7 +22,7 @@ from notam.db import (
 # DB setup
 # -----------------------------------------------------------------------------
 #os.environ["DATABASE_URL"] = os.getenv("SUPABASE_DB_URL") or os.getenv("LOCAL_DB_URL") or ""
-os.environ["DATABASE_URL"] = os.getenv("LOCAL_DB_URL")
+os.environ["DATABASE_URL"] = os.getenv("SUPABASE_DB_URL")
 #DATABASE_URL = os.environ["DATABASE_URL"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 if not DATABASE_URL:
