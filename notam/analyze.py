@@ -32,6 +32,14 @@ DAILY / WEEKLY / MONTHLY
 EVENT_SPECIFIC (one-off)
 
 All times must be ISO-8601 UTC (e.g., 2025-08-09T14:00:00Z). If the NOTAM lacks explicit coordinates, omit them.
+
+If the NOTAM contains explicit date ranges or lists, expand them into individual operational_instances, one per active date.
+If the NOTAM specifies daily start/end times, generate one instance per day using those times.
+If multiple dates appear before a single time block, apply that time block to each of those dates, not just the last one.
+
+For the one-line description, provide a very short plain-English summary so a pilot immediately understands the operational impact. 
+Mention only the affected element (e.g., runway, taxiway, stand, apron, navaid, airspace) and the consequence and its extent. 
+Do not include dates, times, references, identifiers, frequencies, or codes. Do not repeat the same information in different words. Keep it clear, concise, and operational.
 """
 
 # Prompt template

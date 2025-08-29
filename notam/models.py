@@ -135,6 +135,7 @@ class OperationalTag(str, Enum):
     RUNWAY_HOLD_POSITION_CHANGE = "RUNWAY_HOLD_POSITION_CHANGE"
     DESIGNATOR_CHANGE = "DESIGNATOR_CHANGE"
     ATS_UNAVAILABLE = "ATS_UNAVAILABLE"
+    ENROUTE_ROUTE_CHANGE = "ENROUTE_ROUTE_CHANGE"
 
 # Sub-models for complex structures
 class Coordinate(BaseModel):
@@ -213,6 +214,10 @@ class AircraftApplicability(BaseModel):
     propulsion: Optional[List[AircraftPropulsion]] = Field(default=None)
     wingspan_restriction: Optional[WingspanRestriction] = Field(default=None,description="Wingspan bounds in meters for which the restriction applies.")
 
+class SpecificPeriodUTC(BaseModel):
+    start_iso: str = Field(description="Date and time the individiual event in the NOTAM was started, in ISO 8601 UTC format")  # "YYYY-MM-DDThh:mm:ssZ"
+    end_iso: str = Field(description="Date and time the individiual event in the NOTAM was ended, in ISO 8601 UTC format")   # "YYYY-MM-DDThh:mm:ssZ"
+
 
 # Main NOTAM Analysis Model
 class Notam_Analysis(BaseModel):
@@ -220,7 +225,10 @@ class Notam_Analysis(BaseModel):
     notam_number: str = Field(description="Unique identifier for the NOTAM")
     issue_time: str = Field(description="Date and time the NOTAM was issued, in ISO 8601 UTC format")
     notam_category: NotamCategory = Field(description="NOTAM scope: 'FIR' or 'Airport'")
-
+    operational_instances: Optional[List[SpecificPeriodUTC]] = Field(
+        default_factory=list,
+        description="List of absolute UTC windows when the event inside the NOTAM is in effect if any."
+    )
 
     # Enhanced Severity Classification
     severity_level: SeverityLevel = Field(description="Enhanced severity classification")
@@ -250,6 +258,7 @@ class Notam_Analysis(BaseModel):
 
     # Operational Analysis
     notam_summary: str = Field(description="Brief human-readable summary of the NOTAM")
+    one_line_description: str = Field(description="One line description of the nature of the NOTAM event")
 
     # Administrative
     replacing_notam: Optional[str] = Field(None, description="NOTAM number this notice replaces")

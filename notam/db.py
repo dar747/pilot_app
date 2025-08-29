@@ -14,6 +14,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.sql import func
 from sqlalchemy import event
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,9 @@ class PrimaryCategoryEnum(str, enum.Enum):
     FLOW_CONTROL = "FLOW_CONTROL"
     COMMUNICATION_SERVICES = "COMMUNICATION_SERVICES"
     OBSTACLES = "OBSTACLES"
+    RESTRICTED_AREA = "RESTRICTED_AREA"
+    ROUTING = "ROUTING"
+    MILITARY_ACTIVITY = "MILITARY_ACTIVITY"
 
 
 # ---------------------------------------------------------------------------
@@ -320,14 +324,15 @@ class NotamRecord(Base):
 
     # Basic
     notam_number = Column(String(50), nullable=False, index=True)
-    issue_time = Column(String, nullable=False)
+    issue_time = Column(DateTime(timezone=True), nullable=False)
 
     notam_category = Column(Enum(NotamCategoryEnum, native_enum=False), nullable=False, index=True)
     severity_level = Column(Enum(SeverityLevelEnum, native_enum=False), nullable=False, index=True)
 
     # Temporal
-    start_time = Column(String, nullable=False, index=True)
-    end_time = Column(String, index=True)
+    start_time = Column(DateTime(timezone=True), nullable=False, index=True)  # CHANGED
+    end_time = Column(DateTime(timezone=True), index=True)
+    operational_instance = Column(JSON)
     time_classification = Column(Enum(TimeClassificationEnum, native_enum=False))
 
     # Applicability
@@ -337,12 +342,14 @@ class NotamRecord(Base):
     # Single primary category
     primary_category = Column(Enum(PrimaryCategoryEnum, native_enum=False), nullable=False, index=True)
 
+
     # Location / Area
     affected_area = Column(JSON)                      # keep JSON for geometry
     affected_airports_snapshot = Column(JSON)         # quick snapshot list
 
     # Content
     notam_summary = Column(Text, nullable=False)
+    one_line_description = Column(Text, nullable=True)
     icao_message = Column(Text)
 
     # Administrative
@@ -350,9 +357,10 @@ class NotamRecord(Base):
     raw_hash = Column(String(64), unique=True, index=True)
 
     # Scoring (server-side base score; client will reweight)
-    base_score = Column(SmallInteger)                 # 0..100
-    score_features = Column(JSON)                     # dict of raw features
-    score_explanation = Column(String(400))           # short reason
+    base_score_vfr = Column(SmallInteger)                 # 0..100
+    # short reason
+    # Scoring (server-side base score; client will reweight)
+    base_score_ifr = Column(SmallInteger)                 # 0..100
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
@@ -463,6 +471,47 @@ class NotamHistory(Base):
     __table_args__ = (
         Index('idx_history_notam_time', 'notam_id', 'timestamp'),
     )
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+def _parse_iso_to_utc(iso_str: str | None) -> datetime | None:
+    """Parse ISO string to aware UTC datetime. Accepts ...Z, offsets, or naive."""
+    if not iso_str:
+        return None
+    s = iso_str.strip()
+    if s.endswith(('Z', 'z')):
+        s = s[:-1] + '+00:00'
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _ensure_bounds_from_instances(target: "NotamRecord") -> None:
+    """
+    If operational_instance.operational_instances exists, set:
+      start_time = min(start_iso), end_time = max(end_iso)
+    (Both stored as aware UTC datetimes.)
+    """
+    payload = target.operational_instance or {}
+    slices = payload.get("operational_instances") or []
+    starts, ends = [], []
+    for sl in slices:
+        try:
+            s = _parse_iso_to_utc(sl.get("start_iso"))
+            e = _parse_iso_to_utc(sl.get("end_iso"))
+            if s and e:
+                starts.append(s); ends.append(e)
+        except Exception:
+            continue
+    if starts and ends:
+        target.start_time = min(starts)
+        target.end_time = max(ends)
+
+    # If someone set issue_time as a string earlier, normalize it too.
+    if isinstance(target.issue_time, str):
+        target.issue_time = _parse_iso_to_utc(target.issue_time)
 
 
 # ---------------------------------------------------------------------------
