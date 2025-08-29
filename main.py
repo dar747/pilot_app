@@ -1,41 +1,41 @@
 # main.py
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, or_, select
+from sqlalchemy import create_engine, or_
 from sqlalchemy.orm import sessionmaker, selectinload
 
 from notam.generate_briefing import briefing_chain
 from notam.db import (
     NotamRecord, Airport, OperationalTag,
-    # enums
-    SeverityLevelEnum, NotamCategoryEnum, PrimaryCategoryEnum,
+    NotamCategoryEnum, PrimaryCategoryEnum,
 )
 
-# -----------------------------------------------------------------------------
-# DB setup
-# -----------------------------------------------------------------------------
-#os.environ["DATABASE_URL"] = os.getenv("SUPABASE_DB_URL") or os.getenv("LOCAL_DB_URL") or ""
-os.environ["DATABASE_URL"] = os.getenv("SUPABASE_DB_URL")
-#DATABASE_URL = os.environ["DATABASE_URL"]
-DATABASE_URL = os.environ["DATABASE_URL"]
+# -------------------- DB setup --------------------
+DATABASE_URL = os.getenv("SUPABASE_DB_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is empty. Set SUPABASE_DB_URL or LOCAL_DB_URL.")
+    raise RuntimeError("DATABASE_URL is empty. Set LOCAL_DB_URL (or wire SUPABASE_DB_URL + fallback).")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=1800,   # recycle idle conns every 30 min
+    pool_timeout=30,
+)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 print(f"🔌 Using DATABASE_URL: {DATABASE_URL}")
-print("Loaded API file:", __file__)
 
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
+# -------------------- App --------------------
 app = FastAPI(title="NOTAM Analysis API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -43,41 +43,103 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+# -------------------- Helpers --------------------
 def _enum_val(v):
-    """Return enum's value or the value itself if already a string/None."""
     return getattr(v, "value", v)
 
+def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _z(dt: Optional[datetime]) -> Optional[str]:
+    """UTC datetime -> 'YYYY-MM-DDTHH:MM:SSZ' string (or None)."""
+    if dt is None:
+        return None
+    return _to_utc(dt).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    # Accept Z or offset
+    st = s.strip()
+    if st.endswith(("Z", "z")):
+        st = st[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(st)
+    except Exception:
+        return None
+    return _to_utc(dt)
+
+def _is_active_now(record: NotamRecord, now_utc: datetime) -> bool:
+    # Coarse gates
+    if record.start_time and record.start_time > now_utc:
+        return False
+    if record.end_time and record.end_time < now_utc:
+        return False
+
+    # If operational instances exist, require at least one interval that covers now
+    ops = (record.operational_instance or {}).get("operational_instances") or []
+    if ops:
+        for sl in ops:
+            s = _parse_iso_utc(sl.get("start_iso"))
+            e = _parse_iso_utc(sl.get("end_iso"))
+            if s and e and s <= now_utc <= e:
+                return True
+        return False  # had instances, but none cover "now"
+    return True  # no instances → fall back to coarse window
+
 def format_notam(record: NotamRecord) -> Dict[str, Any]:
-    """Minimal JSON shape for the app (extend as needed)."""
     def designator(r):
         return f"{r.runway_number}{r.runway_side or ''}"
 
-    # assume at most one condition per runway
+    # Runways + condition match
     affected_runways = []
+    rc_map = {(c.runway_number, c.runway_side): c for c in record.runway_conditions}
     for r in record.runways:
-        # try to find a matching condition (naive: same runway_number/side)
-        cond = next(
-            (c for c in record.runway_conditions
-             if c.runway_number == r.runway_number and c.runway_side == r.runway_side),
-            None
-        )
+        cond = rc_map.get((r.runway_number, r.runway_side))
         affected_runways.append({
             "runway": designator(r),
             "friction_value": getattr(cond, "friction_value", None) if cond else None,
-            # you can add more condition fields here
+        })
+
+    # Obstacles
+    obstacles = []
+    for o in record.obstacles:
+        obstacles.append({
+            "type": o.type,
+            "height_agl_ft": o.height_agl_ft,
+            "height_amsl_ft": o.height_amsl_ft,
+            "location": (
+                {"latitude": o.latitude, "longitude": o.longitude}
+                if (o.latitude is not None and o.longitude is not None) else None
+            ),
+            "lighting": o.lighting,
+            "runway_reference": (
+                {
+                    "runway_id": o.runway_id,
+                    "reference_type": o.reference_type,
+                    "offset_distance_m": o.offset_distance_m,
+                    "offset_direction": o.offset_direction,
+                    "lateral_half_width_m": o.lateral_half_width_m,
+                    "corridor_orientation": o.corridor_orientation,
+                }
+                if any([
+                    o.runway_id, o.reference_type, o.offset_distance_m,
+                    o.offset_direction, o.lateral_half_width_m, o.corridor_orientation
+                ]) else None
+            ),
         })
 
     return {
         "id": record.id,
         "notam_number": record.notam_number,
-        "issue_time": record.issue_time,
+        "issue_time": _z(record.issue_time),
         "notam_category": _enum_val(record.notam_category),
-        "severity_level": _enum_val(record.severity_level),
-        "start_time": record.start_time,
-        "end_time": record.end_time,
+        "start_time": _z(record.start_time),
+        "end_time": _z(record.end_time),
         "time_classification": _enum_val(record.time_classification),
         "time_of_day_applicability": _enum_val(record.time_of_day_applicability),
         "flight_rule_applicability": _enum_val(record.flight_rule_applicability),
@@ -85,33 +147,34 @@ def format_notam(record: NotamRecord) -> Dict[str, Any]:
         "affected_area": record.affected_area,
         "affected_airports_snapshot": record.affected_airports_snapshot,
         "notam_summary": record.notam_summary,
+        "one_line_description": record.one_line_description,
         "icao_message": record.icao_message,
         "replacing_notam": record.replacing_notam,
         "airports": [a.icao_code for a in record.airports],
         "operational_tags": [t.tag_name for t in record.operational_tags],
-        "flight_phases":[p.phase for p in record.flight_phase_links],
-     #   "obstacles":
+        "flight_phases": [_enum_val(p.phase) for p in record.flight_phase_links],
         "affected_runways": affected_runways,
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
+        "obstacles": obstacles,
+        "operational_instances": (record.operational_instance or {}).get("operational_instances"),
+        "created_at": _z(record.created_at),
+        "updated_at": _z(record.updated_at),
         "affected_aircraft": {
             "sizes": [_enum_val(s) for s in record.aircraft_sizes],
             "propulsions": [_enum_val(p) for p in record.aircraft_propulsions],
-            "wingspan": {
-                "min_m": record.wingspan_restriction.min_m if record.wingspan_restriction else None,
-                "max_m": record.wingspan_restriction.max_m if record.wingspan_restriction else None,
-                "min_inclusive": record.wingspan_restriction.min_inclusive if record.wingspan_restriction else None,
-                "max_inclusive": record.wingspan_restriction.max_inclusive if record.wingspan_restriction else None,
-            } if record.wingspan_restriction else None,
+            "wingspan": (
+                {
+                    "min_m": record.wingspan_restriction.min_m,
+                    "max_m": record.wingspan_restriction.max_m,
+                    "min_inclusive": record.wingspan_restriction.min_inclusive,
+                    "max_inclusive": record.wingspan_restriction.max_inclusive,
+                } if record.wingspan_restriction else None
+            ),
         },
-        "base_score": record.base_score,
-
-
+        "base_score_vfr": record.base_score_vfr,
+        "base_score_ifr": record.base_score_ifr,
     }
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
+# -------------------- Routes --------------------
 @app.get("/")
 def root():
     return {"message": "✅ NOTAM API is running. Use /notams to query."}
@@ -132,27 +195,57 @@ def check_db_connection():
     finally:
         session.close()
 
-@app.get("/notams", response_model=List[dict])
-def get_all_notams(
-    airport: Optional[str] = Query(None, description="Filter by ICAO code"),
-    severity_level: Optional[str] = Query(None, description="CRITICAL, OPERATIONAL, ADVISORY"),
-    notam_category: Optional[str] = Query(None, description="FIR or AIRPORT"),
-    primary_category: Optional[str] = Query(None, description="RUNWAY_OPERATIONS, AERODROME_OPERATIONS, ..."),
-    start_time_after: Optional[datetime] = Query(None),
-    end_time_before: Optional[datetime] = Query(None),
-    operational_tag: Optional[str] = Query(None, description="substring match on tag name"),
-    replacing_notam: Optional[str] = Query(None),
-    active_only: Optional[bool] = Query(False, description="only currently active NOTAMs"),
-    keyword: Optional[str] = Query(None, description="search NOTAM summary text"),
+@app.get("/airports/{airport}/notams", response_model=List[dict])
+def list_notams_for_airport(
+    airport: str,
+    notam_category: Optional[NotamCategoryEnum] = Query(None, description="FIR or AIRPORT"),
+    primary_category: Optional[PrimaryCategoryEnum] = Query(None),
+    start_time_after: Optional[datetime] = Query(None, description="UTC time"),
+    end_time_before: Optional[datetime] = Query(None, description="UTC time"),
+    active_only: bool = Query(False, description="Coarse window + operational_instances"),
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
     session = SessionLocal()
     try:
+        # --- build coarse filters once ---
+        def apply_coarse_filters(q):
+            if notam_category:
+                q = q.filter(NotamRecord.notam_category == notam_category.value)
+            if primary_category:
+                q = q.filter(NotamRecord.primary_category == primary_category.value)
+            if start_time_after:
+                q = q.filter(NotamRecord.start_time >= _to_utc(start_time_after))
+            if end_time_before:
+                q = q.filter(or_(NotamRecord.end_time <= _to_utc(end_time_before),
+                                 NotamRecord.end_time.is_(None)))
+            return q
+
+        # --- page by IDs to avoid duplicates from the airport M2M join ---
+        ids_subq = (
+            session.query(NotamRecord.id)
+            .join(NotamRecord.airports)
+            .filter(Airport.icao_code == airport.upper())
+            .distinct(NotamRecord.id)   # DISTINCT ON (id)
+        )
+        ids_subq = apply_coarse_filters(ids_subq)
+
+        # IMPORTANT: when using DISTINCT ON (id), id must be the first ORDER BY term
+        ids_subq = ids_subq.order_by(
+            NotamRecord.id,                 # matches DISTINCT ON
+            NotamRecord.start_time.desc(),
+            NotamRecord.issue_time.desc(),
+        ).offset(offset).limit(limit * (3 if active_only else 1))
+
+        id_rows = [r[0] for r in ids_subq.all()]
+        if not id_rows:
+            return []
+
+        # --- fetch full rows with efficient eager loading ---
         q = (
             session.query(NotamRecord)
+            .filter(NotamRecord.id.in_(id_rows))
             .options(
-                # eager-load to avoid N+1
                 selectinload(NotamRecord.airports),
                 selectinload(NotamRecord.operational_tags),
                 selectinload(NotamRecord.runways),
@@ -161,59 +254,25 @@ def get_all_notams(
                 selectinload(NotamRecord.wingspan_restriction),
                 selectinload(NotamRecord.aircraft_size_links),
                 selectinload(NotamRecord.aircraft_propulsion_links),
-
-
+                selectinload(NotamRecord.obstacles),
             )
         )
+        rows = q.all()
 
-        if airport:
-            q = q.join(NotamRecord.airports).filter(Airport.icao_code == airport.upper())
-
-        if severity_level:
-            try:
-                sev = SeverityLevelEnum(severity_level.upper())
-                q = q.filter(NotamRecord.severity_level == sev)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid severity_level")
-
-        if notam_category:
-            try:
-                cat = NotamCategoryEnum(notam_category.upper())
-                q = q.filter(NotamRecord.notam_category == cat)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid notam_category")
-
-        if primary_category:
-            try:
-                pc = PrimaryCategoryEnum(primary_category.upper())
-                q = q.filter(NotamRecord.primary_category == pc)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid primary_category")
-
-        if start_time_after:
-            q = q.filter(NotamRecord.start_time >= start_time_after)
-
-        if end_time_before:
-            q = q.filter(or_(NotamRecord.end_time <= end_time_before, NotamRecord.end_time.is_(None)))
-
-        if operational_tag:
-            q = q.filter(NotamRecord.operational_tags.any(OperationalTag.tag_name.ilike(f"%{operational_tag}%")))
-
-        if replacing_notam:
-            q = q.filter(NotamRecord.replacing_notam == replacing_notam)
-
-        if keyword:
-            q = q.filter(NotamRecord.notam_summary.ilike(f"%{keyword}%"))
-
+        # --- exact-time filter using operational_instances (Python side) ---
         if active_only:
-            now = datetime.now(timezone.utc)
-            q = q.filter(NotamRecord.start_time <= now).filter(
-                or_(NotamRecord.end_time.is_(None), NotamRecord.end_time >= now)
-            )
+            now_utc = datetime.now(timezone.utc)
+            rows = [r for r in rows if _is_active_now(r, now_utc)]
 
-        q = q.order_by(NotamRecord.start_time.desc(), NotamRecord.issue_time.desc())
-        rows = q.offset(offset).limit(limit).all()
+        # Restore deterministic sort (IN() doesn’t preserve order)
+        rows.sort(key=lambda r: (
+            r.start_time or datetime.min.replace(tzinfo=timezone.utc),
+            r.issue_time or datetime.min.replace(tzinfo=timezone.utc),
+            r.id
+        ), reverse=True)
 
+        # final page size
+        rows = rows[:limit]
         return [format_notam(n) for n in rows]
     finally:
         session.close()
@@ -221,3 +280,12 @@ def get_all_notams(
 @app.get("/briefing-from-input")
 async def get_briefing_from_input(query: str):
     return await briefing_chain(query)
+
+@app.get("/enums/primary-categories", response_model=List[str])
+def list_primary_categories():
+    return [e.value for e in PrimaryCategoryEnum]
+
+@app.get("/enums/notam-categories", response_model=List[str])
+def list_notam_categories():
+    from notam.db import NotamCategoryEnum
+    return [e.value for e in NotamCategoryEnum]

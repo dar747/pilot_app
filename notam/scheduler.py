@@ -61,7 +61,7 @@ def parse_runway_id(runway_id: str) -> Tuple[Optional[int], Optional[str]]:
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root
 
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
 langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
 os.environ["LANGCHAIN_PROJECT"] = "Analyse_NOTAM"
 
@@ -81,7 +81,7 @@ def build_and_populate_db(overwrite: bool = False):
     to_analyze = []
     seen_in_run = set()
 
-    for n in all_notams[0:10]:  # keep your local cap; remove for full run
+    for n in all_notams:  # keep your local cap; remove for full run
         h = get_hash(n["notam_number"], n["icao_message"])
         print(f"NOTAM: {n['notam_number']}, Hash: {h}")
         if h in existing_hashes or h in seen_in_run:
@@ -101,8 +101,8 @@ def build_and_populate_db(overwrite: bool = False):
     asyncio.run(run_analysis(to_analyze, batch_size=200, max_concurrency=8))
 
 def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
-    df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=10)
-    #df = pd.read_csv(csv_path, usecols=['Designator', 'URL']) # remove nrows for full
+    #df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=5)
+    df = pd.read_csv(csv_path, usecols=['Designator', 'URL']) # remove nrows for full
     df = df.dropna(how='all', subset=['Designator', 'URL'])
     df = df[~(
         (df['Designator'].astype(str).str.strip() == '') &
@@ -124,7 +124,7 @@ def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
             resp = requests.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-                timeout=20
+                timeout=10
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -175,25 +175,35 @@ def clear_db():
 
 # ----------------- persistence -----------------
 
-def iso_utc_z(dt_like) -> str | None:
+from datetime import datetime, timezone
+
+def parse_iso_to_utc(dt_like) -> datetime | None:
+    """
+    str|datetime -> timezone-aware *UTC* datetime.
+    Accepts '...Z', offsets, or naive (assumed UTC).
+    """
     if dt_like is None:
         return None
-    if isinstance(dt_like, str):
+    if isinstance(dt_like, datetime):
+        dt = dt_like
+    elif isinstance(dt_like, str):
         s = dt_like.strip()
-        # accept Z / offsets / naive
         if s.endswith(('Z','z')):
             s = s[:-1] + '+00:00'
-        try:
-            dt = datetime.fromisoformat(s)
-        except ValueError:
-            return None  # or raise
-    elif isinstance(dt_like, datetime):
-        dt = dt_like
+        dt = datetime.fromisoformat(s)
     else:
-        return None
+        raise TypeError(f"Unsupported datetime type: {type(dt_like)!r}")
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def to_z(dt: datetime | None) -> str | None:
+    """Only for logs/debug: render UTC as 'YYYY-MM-DDTHH:MM:SSZ'."""
+    if dt is None:
+        return None
     return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
 
 def _none_if_nullish(x):
     return None if (x is None or (isinstance(x, str) and x.strip().upper() in {"", "NULL", "NONE"})) else x
@@ -213,11 +223,38 @@ def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
 
         # Core fields / enums  (FIXED: all use Enum types)
         notam.notam_number = notam_number
-        notam.issue_time = iso_utc_z(result.issue_time)
         notam.notam_category = NotamCategoryEnum(result.notam_category.value)
         notam.severity_level = SeverityLevelEnum(result.severity_level.value)
-        notam.start_time = iso_utc_z(result.start_time)
-        notam.end_time = iso_utc_z(_none_if_nullish(getattr(result, "end_time", None)))
+
+        # Datetimes in DB
+        notam.issue_time = parse_iso_to_utc(result.issue_time)
+
+        # Persist the full operational instances JSON (so your API can return it)
+        # Expecting your analyze result to have something like result.operational_instances (list of dicts)
+        # If your model nests it differently, adapt this mapping.
+        ops_array = []
+        if getattr(result, "operational_instances", None):
+            # Ensure the stored JSON keeps the original Z-format strings
+            for sl in result.operational_instances:
+                s = to_z(parse_iso_to_utc(sl.start_iso))
+                e = to_z(parse_iso_to_utc(sl.end_iso))
+                if s and e:
+                    ops_array.append({"start_iso": s, "end_iso": e})
+
+        notam.operational_instance = {"operational_instances": ops_array}
+
+        # Bounds (let DB events also enforce, but we set here to be explicit)
+        if ops_array:
+            starts = [parse_iso_to_utc(s["start_iso"]) for s in ops_array]
+            ends = [parse_iso_to_utc(s["end_iso"]) for s in ops_array]
+            notam.start_time = min(starts)
+            notam.end_time = max(ends)
+        else:
+            # Fallback to analyzer's coarse start/end if provided
+            notam.start_time = parse_iso_to_utc(getattr(result, "start_time", None)) or parse_iso_to_utc(
+                result.issue_time)
+            notam.end_time = parse_iso_to_utc(_none_if_nullish(getattr(result, "end_time", None)))
+
         notam.time_classification = (
             TimeClassificationEnum(result.time_classification.value)
             if getattr(result, "time_classification", None) else None
@@ -229,8 +266,10 @@ def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
         notam.affected_area = result.affected_area.model_dump(exclude_none=True) if result.affected_area else None
         notam.affected_airports_snapshot = result.affected_airports or []
         notam.notam_summary = result.notam_summary
+        notam.one_line_description = result.one_line_description
         notam.icao_message = raw_text
         notam.replacing_notam = result.replacing_notam or None
+
 
         if not is_update:
             session.add(notam)
@@ -360,10 +399,12 @@ def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
                     ))
 
         # Base score (NEW)
-        score, features, why = compute_base_score(notam)
-        notam.base_score = score
-        notam.score_features = features
-        notam.score_explanation = why
+        score_ifr, features_ifr, why_ifr = compute_base_score(notam, profile="IFR")
+        score_vfr, features_vfr, why_vfr = compute_base_score(notam, profile="VFR")
+        notam.base_score_ifr = score_ifr
+        notam.base_score_vfr = score_vfr
+
+
 
         # History
         session.add(NotamHistory(
@@ -424,4 +465,4 @@ async def run_analysis(to_analyze: List[Dict], batch_size=100, max_concurrency=8
 # ----------------- entrypoint -----------------
 
 if __name__ == "__main__":
-    build_and_populate_db(overwrite=True)
+    build_and_populate_db()
