@@ -17,7 +17,7 @@ from notam.db import Base
 config = context.config
 
 # 👇 Ensure sqlalchemy.url is set from env even if alembic.ini uses ${LOCAL_DB_URL}
-db_url = os.getenv("SUPABASE_DB_URL")
+db_url = os.getenv("LOCAL_DB_URL")
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 else:

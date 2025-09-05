@@ -1,4 +1,4 @@
-# analyze.py
+# notam/analyze.py
 
 import os
 from dotenv import load_dotenv
@@ -10,7 +10,12 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from notam.models import Notam_Analysis
 
-llm = ChatOpenAI(model="gpt-5-mini", api_key=openai_api_key)
+llm = ChatOpenAI(
+    model="gpt-5-mini",
+    api_key=openai_api_key,
+    timeout=200,     # seconds; adjust if needed
+    max_retries=0,  # IMPORTANT: we manage retries ourselves
+)
 
 # System instruction with classification guidance
 notam_analysis_system_msg = """
@@ -23,23 +28,27 @@ Severity levels
 
 Prefer operational availability over cause. Tag the consequence, not the reason.
 
-Time classification
-PERMANENT
-LONG_TERM (>90 days)
-MEDIUM_TERM (7–90 days)
-SHORT_TERM (<7 days)
-DAILY / WEEKLY / MONTHLY
-EVENT_SPECIFIC (one-off)
-
 All times must be ISO-8601 UTC (e.g., 2025-08-09T14:00:00Z). If the NOTAM lacks explicit coordinates, omit them.
 
 If the NOTAM contains explicit date ranges or lists, expand them into individual operational_instances, one per active date.
+However, **do not split continuous date ranges** (i.e., if the start date and end date have no gap between them). If the dates and times are consecutive (e.g., the end time of one period directly follows the start time of the next), treat them as a **single operational instance**. Only split into multiple instances if there are **gaps** between the dates and times.
 If the NOTAM specifies daily start/end times, generate one instance per day using those times.
 If multiple dates appear before a single time block, apply that time block to each of those dates, not just the last one.
 
 For the one-line description, provide a very short plain-English summary so a pilot immediately understands the operational impact. 
 Mention only the affected element (e.g., runway, taxiway, stand, apron, navaid, airspace) and the consequence and its extent. 
 Do not include dates, times, references, identifiers, frequencies, or codes. Do not repeat the same information in different words. Keep it clear, concise, and operational.
+
+<For Taxiway Code Extraction Guidance>
+Include:
+Alphabetic codes.
+Alphanumeric codes.
+Do not include:
+Non-alphabetic codes.
+Codes with directions or additional details.
+Codes with extra descriptors attached.
+</Taxiway Code Extraction Guidance>
+
 """
 
 # Prompt template

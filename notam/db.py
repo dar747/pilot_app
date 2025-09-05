@@ -4,7 +4,6 @@ from __future__ import annotations
 import enum
 import os
 from contextlib import contextmanager
-from typing import Optional
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, Float, Boolean, Text, DateTime,
@@ -14,15 +13,17 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.sql import func
 from sqlalchemy import event
-from datetime import datetime, timezone
+from notam.timeutils import parse_iso_to_utc as _parse_iso_to_utc
+from dotenv import load_dotenv
 
 
+load_dotenv()  # does nothing if no .env present
 # ---------------------------------------------------------------------------
 # Engine & Session
 # ---------------------------------------------------------------------------
 
 # Example: "postgresql+psycopg2://user:pass@localhost:5432/notamdb"
-DATABASE_URL = os.getenv("LOCAL_DB_URL", "sqlite:///./notam.db")
+DATABASE_URL = os.getenv("LOCAL_DB_URL")
 
 engine = create_engine(
     DATABASE_URL,
@@ -224,7 +225,7 @@ class NotamTaxiway(Base):
 
     notam_id = Column(Integer, ForeignKey("notams.id", ondelete="CASCADE"), primary_key=True)
     airport_code = Column(String(4), ForeignKey("airports.icao_code", ondelete="CASCADE"), primary_key=True)
-    taxiway_id = Column(String(16), primary_key=True)
+    taxiway_id = Column(String(128), primary_key=True)
 
     __table_args__ = (
         # If you're on Postgres and want a format check, you can add:
@@ -262,13 +263,6 @@ class NotamObstacle(Base):
     latitude = Column(Float)
     longitude = Column(Float)
     lighting = Column(String(32), nullable=False)
-    runway_id = Column(String(7))
-    reference_type = Column(String(128))
-    offset_distance_m = Column(Float)
-    offset_direction = Column(String(120))
-    lateral_half_width_m = Column(Float)
-    corridor_orientation = Column(String(32))
-
 
 class NotamRunway(Base):
     __tablename__ = "notam_runways"
@@ -333,7 +327,6 @@ class NotamRecord(Base):
     start_time = Column(DateTime(timezone=True), nullable=False, index=True)  # CHANGED
     end_time = Column(DateTime(timezone=True), index=True)
     operational_instance = Column(JSON)
-    time_classification = Column(Enum(TimeClassificationEnum, native_enum=False))
 
     # Applicability
     time_of_day_applicability = Column(Enum(TimeOfDayApplicabilityEnum, native_enum=False))
@@ -382,7 +375,7 @@ class NotamRecord(Base):
         cascade="all, delete-orphan",
         primaryjoin="NotamRecord.id==NotamAircraftSizeLink.notam_id",
         lazy="selectin",
-        viewonly=False,
+        viewonly=True,
     )
 
     @property
@@ -395,7 +388,7 @@ class NotamRecord(Base):
         cascade="all, delete-orphan",
         primaryjoin="NotamRecord.id==NotamAircraftPropulsionLink.notam_id",
         lazy="selectin",
-        viewonly=False,
+        viewonly=True,
     )
 
     @property
@@ -472,21 +465,6 @@ class NotamHistory(Base):
         Index('idx_history_notam_time', 'notam_id', 'timestamp'),
     )
 
-# ---------------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------------
-
-def _parse_iso_to_utc(iso_str: str | None) -> datetime | None:
-    """Parse ISO string to aware UTC datetime. Accepts ...Z, offsets, or naive."""
-    if not iso_str:
-        return None
-    s = iso_str.strip()
-    if s.endswith(('Z', 'z')):
-        s = s[:-1] + '+00:00'
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 def _ensure_bounds_from_instances(target: "NotamRecord") -> None:
     """
