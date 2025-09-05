@@ -1,3 +1,4 @@
+# models.py
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
@@ -24,17 +25,6 @@ class FlightPhase(str, Enum):
     ARRIVAL = "ARRIVAL"
     GROUND_OPS = "GROUND_OPS"
     ALL_PHASES = "ALL_PHASES"
-
-class TimeClassification(str, Enum):
-    PERMANENT = "PERMANENT"
-    LONG_TERM = "LONG_TERM"
-    MEDIUM_TERM = "MEDIUM_TERM"
-    SHORT_TERM = "SHORT_TERM"
-    DAILY = "DAILY"
-    WEEKLY ="WEEKLY"
-    MONTHLY = "MONTHLY"
-    EVENT_SPECIFIC = "EVENT_SPECIFIC"
-
 
 class TimeOfDayApplicability(str, Enum):
     DAY = "DAY ONLY"
@@ -67,6 +57,10 @@ class PrimaryCategory(str, Enum):
     FLOW_CONTROL = "FLOW_CONTROL"
     COMMUNICATION_SERVICES = "COMMUNICATION_SERVICES"
     OBSTACLES = "OBSTACLES"
+    RESTRICTED_AREA = "RESTRICTED_AREA"
+    ROUTING = "ROUTING"
+    MILITARY_ACTIVITY = "MILITARY_ACTIVITY"
+
 
 class OperationalTag(str, Enum):
     AIRPORT_CLOSURE = "AIRPORT_CLOSURE"
@@ -142,25 +136,6 @@ class Coordinate(BaseModel):
     latitude: float = Field(description="Latitude in decimal degrees")
     longitude: float = Field(description="Longitude in decimal degrees")
 
-class RunwayReferencePoint(BaseModel):
-    runway_id: str = Field(description="Runway identifiers must be in the format NN or NNX (e.g., 07, 07L, 25R)")
-    reference_type: str = Field(description="Usually 'Threshold' or 'Midpoint'")
-    offset_distance_m: float = Field(description="Distance from the reference point in meters")
-    offset_direction: Optional[str] = Field(
-        None,
-        description="Direction from the reference point: 'Along Runway', 'Left', 'Right', 'Opposite', etc."
-    )
-
-    lateral_half_width_m: Optional[float] = Field(
-        None,
-        description="Half-width from runway centerline in meters (if corridor)"
-    )
-    corridor_orientation: Optional[str] = Field(
-        None,
-        description="Orientation of the corridor: 'Parallel', 'Perpendicular', etc."
-    )
-
-
 class AffectedArea(BaseModel):
     center: Optional[Coordinate] = Field(description="Center point of affected area")
     radius_nm: Optional[float] = Field(None, description="Radius in nautical miles")
@@ -177,10 +152,6 @@ class ExtractedObstacle(BaseModel):
     height_amsl_ft: Optional[int] = Field(None, description="Height above mean sea level in feet")
     location: Optional[Coordinate] = Field(None, description="Absolute location if known")
     lighting: str = Field(description="Lighting status: LIT, UNLIT, PARTIAL")
-    runway_reference: Optional[RunwayReferencePoint] = Field(
-        None,
-        description="Relative runway/ARP reference point"
-    )
 
 class ExtractedRunwayCondition(BaseModel):
     runway_id: str = Field(description="Runway identifiers must be in the format NN or NNX (e.g., 07, 07L, 25R)")
@@ -189,7 +160,7 @@ class ExtractedRunwayCondition(BaseModel):
 class ExtractedElements(BaseModel):
     runways: List[str] = Field(default_factory=list, description="Affected runway identifiers")
     runway_conditions: List[ExtractedRunwayCondition] = Field(default_factory=list)
-    taxiways: List[str] = Field(default_factory=list, description="Affected taxiway identifiers")
+    taxiways: List[str] = Field(default_factory=list, description="Store only the Affected taxiway identifiers")
     obstacles: List[ExtractedObstacle] = Field(default_factory=list)
     procedures: List[str] = Field(default_factory=list, description="Affected SID/STAR procedure names")
 
@@ -236,8 +207,6 @@ class Notam_Analysis(BaseModel):
     # Temporal Information
     start_time: str = Field(description="Start time in ISO 8601 UTC format (B field)")
     end_time: str = Field(None, description="End time in ISO 8601 UTC format (C field), store NULL if permanent NOTAM")
-    time_classification: TimeClassification = Field(description="Duration-base"
-                                                                "d classification")
 
     # Applicability (enhanced)
     flight_phases: List[FlightPhase] = Field(description="Affected flight phases")
@@ -268,39 +237,6 @@ class Notam_Analysis(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat()
         }
-
-
-# # Helper function to calculate display priority
-# def calculate_display_priority(analysis: Notam_Analysis) -> int:
-#     """Calculate display priority based on multiple factors"""
-#     priority = 50  # Base priority
-#
-#     # Severity impact
-#     if analysis.severity_level == SeverityLevel.CRITICAL:
-#         priority += 30
-#     elif analysis.severity_level == SeverityLevel.OPERATIONAL:
-#         priority += 15
-#
-#     # Urgency impact
-#     if analysis.urgency_indicator == UrgencyIndicator.IMMEDIATE:
-#         priority += 15
-#     elif analysis.urgency_indicator == UrgencyIndicator.URGENT:
-#         priority += 10
-#
-#     # Safety critical
-#     if analysis.safety_assessment.safety_critical:
-#         priority += 10
-#
-#     # Emergency services impact
-#     if analysis.safety_assessment.emergency_impact:
-#         priority += 5
-#
-#     # Multiple runway impact
-#     if len(analysis.affected_runway) > 1:
-#         priority += 5
-#
-#     return min(priority, 100)  # Cap at 100
-#
 
 class Notam_Briefing(BaseModel):
     summary: str = Field(description="Detailed and personalized briefing of the NOTAM.")

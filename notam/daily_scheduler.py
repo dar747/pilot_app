@@ -1,43 +1,64 @@
-# daily_scheduler.py
-
+# scripts/daily_scheduler.py  (or wherever you run it)
 from apscheduler.schedulers.blocking import BlockingScheduler
-from notam.scheduler import build_and_populate_db
-from notam.push_to_supabase import push_new_to_supabase
-import logging
-import os
+from apscheduler.triggers.cron import CronTrigger
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import logging, os, sys
 
-# Set up logging
-log_dir = "../logs"
-os.makedirs(log_dir, exist_ok=True)
+from notam.pipeline import run_pipeline
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(f"{log_dir}/notam_daily.log"),
-        logging.StreamHandler()  # console output
-    ]
-)
+# --- logging: console + rotating file ---
+logs_dir = Path(__file__).resolve().parents[1] / "logs"
+logs_dir.mkdir(parents=True, exist_ok=True)
+log_path = logs_dir / "daily_scheduler.log"
 
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+
+ch = logging.StreamHandler(sys.stdout); ch.setFormatter(fmt)
+fh = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=5, encoding="utf-8"); fh.setFormatter(fmt)
+root.handlers = [ch, fh]
 log = logging.getLogger(__name__)
 
-# Define the job
+# --- config ---
+CSV_PATH = os.getenv("NOTAM_CSV") or str(Path(__file__).resolve().parents[1] / "data" / "Airport Database - NOTAM ID.csv")
+
+# Optional hard guard: fail fast if overwrite envs are present in prod
+forbidden_envs = ["NOTAM_OVERWRITE_ALL", "NOTAM_OVERWRITE_DB_IDS", "NOTAM_ONLY_OVERWRITE_IDS"]
+bad = [k for k in forbidden_envs if os.getenv(k)]
+if bad:
+    raise RuntimeError(f"Refusing to start: overwrite env var(s) set in production: {bad}")
+
 def daily_job():
     try:
-        log.info("🛫 Starting NOTAM analysis and sync...")
-        build_and_populate_db(overwrite=False)
-        push_new_to_supabase(overwrite=False)
+        log.info("🛫 Starting NOTAM ingestion (incremental, no overwrite)")
+        run_pipeline(
+            csv_path=CSV_PATH,
+            overwrite=False,              # legacy: never wipe
+            overwrite_all=False,          # never TRUNCATE
+            overwrite_db_ids=None,        # never target-delete
+            only_overwrite_ids=False,     # never strict mode
+            max_concurrency=80,           # tune for your infra
+        )
         log.info("✅ Daily NOTAM job completed.")
-    except Exception as e:
-        log.exception("❌ Daily job failed with exception:")
+    except Exception:
+        log.exception("❌ Daily job failed")
 
-# Schedule the job
 if __name__ == "__main__":
-    scheduler = BlockingScheduler()
-    #scheduler.add_job(daily_job, trigger='cron', hour=3, minute=0)  # Daily at 03:00 AM
-    scheduler.add_job(daily_job, trigger='interval', minutes=30)
-    log.info("Scheduler is running... (Ctrl+C to stop)")
+    # UTC, coalesce missed runs into one, allow 10 min misfire grace, single instance at a time
+    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler.add_job(
+        daily_job,
+        trigger=CronTrigger(hour=3, minute=0),   # run daily at 03:00 UTC
+        id="daily_notam_ingest",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=600,                  # seconds
+        max_instances=1,
+    )
+    log.info("Scheduler is running (UTC)… Ctrl+C to stop. Log file: %s", log_path)
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        log.info("👋 Scheduler stopped manually.")
+        log.info("Scheduler stopped.")

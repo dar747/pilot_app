@@ -20,12 +20,13 @@ from notam.db import (
     NotamWingspanRestriction, NotamTaxiway, NotamProcedure, NotamObstacle,
     NotamRunway, NotamRunwayCondition, NotamFlightPhase,
     # Enums
-    SeverityLevelEnum, TimeClassificationEnum, TimeOfDayApplicabilityEnum,
+    SeverityLevelEnum, TimeOfDayApplicabilityEnum,
     FlightRuleApplicabilityEnum, AircraftSizeEnum, AircraftPropulsionEnum,
     PrimaryCategoryEnum, NotamCategoryEnum, FlightPhaseEnum,
     # M2M tables
     notam_aircraft_propulsions, notam_aircraft_sizes,  # NEW: sizes was missing
 )
+from notam.timeutils import parse_iso_to_utc, to_z
 
 # ----------------- helpers -----------------
 
@@ -81,7 +82,7 @@ def build_and_populate_db(overwrite: bool = False):
     to_analyze = []
     seen_in_run = set()
 
-    for n in all_notams:  # keep your local cap; remove for full run
+    for n in all_notams[0:300]:  # keep your local cap; remove for full run
         h = get_hash(n["notam_number"], n["icao_message"])
         print(f"NOTAM: {n['notam_number']}, Hash: {h}")
         if h in existing_hashes or h in seen_in_run:
@@ -98,7 +99,7 @@ def build_and_populate_db(overwrite: bool = False):
         print("🎉 All NOTAMs already analyzed and stored. Exiting.")
         return
 
-    asyncio.run(run_analysis(to_analyze, batch_size=200, max_concurrency=8))
+    asyncio.run(run_analysis(to_analyze, batch_size=1000, max_concurrency=10))
 
 def fetch_notam_data_from_csv(csv_path: str) -> List[Dict]:
     #df = pd.read_csv(csv_path, usecols=['Designator', 'URL'], nrows=5)
@@ -173,37 +174,6 @@ def clear_db():
     finally:
         session.close()
 
-# ----------------- persistence -----------------
-
-from datetime import datetime, timezone
-
-def parse_iso_to_utc(dt_like) -> datetime | None:
-    """
-    str|datetime -> timezone-aware *UTC* datetime.
-    Accepts '...Z', offsets, or naive (assumed UTC).
-    """
-    if dt_like is None:
-        return None
-    if isinstance(dt_like, datetime):
-        dt = dt_like
-    elif isinstance(dt_like, str):
-        s = dt_like.strip()
-        if s.endswith(('Z','z')):
-            s = s[:-1] + '+00:00'
-        dt = datetime.fromisoformat(s)
-    else:
-        raise TypeError(f"Unsupported datetime type: {type(dt_like)!r}")
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-def to_z(dt: datetime | None) -> str | None:
-    """Only for logs/debug: render UTC as 'YYYY-MM-DDTHH:MM:SSZ'."""
-    if dt is None:
-        return None
-    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
 
 def _none_if_nullish(x):
     return None if (x is None or (isinstance(x, str) and x.strip().upper() in {"", "NULL", "NONE"})) else x
@@ -255,10 +225,6 @@ def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
                 result.issue_time)
             notam.end_time = parse_iso_to_utc(_none_if_nullish(getattr(result, "end_time", None)))
 
-        notam.time_classification = (
-            TimeClassificationEnum(result.time_classification.value)
-            if getattr(result, "time_classification", None) else None
-        )
         notam.time_of_day_applicability = TimeOfDayApplicabilityEnum(result.time_of_day_applicability.value)
         notam.flight_rule_applicability = FlightRuleApplicabilityEnum(result.flight_rule_applicability.value)
         notam.primary_category = PrimaryCategoryEnum(result.primary_category.value)  # FIXED typo
@@ -364,13 +330,7 @@ def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
                     height_amsl_ft=o.height_amsl_ft,
                     latitude=(o.location.latitude if o.location else None),
                     longitude=(o.location.longitude if o.location else None),
-                    lighting=o.lighting,
-                    runway_id=(rp.runway_id if rp else None),
-                    reference_type=(rp.reference_type if rp else None),
-                    offset_distance_m=(rp.offset_distance_m if rp else None),
-                    offset_direction=(rp.offset_direction if rp else None),
-                    lateral_half_width_m=(rp.lateral_half_width_m if rp else None),
-                    corridor_orientation=(rp.corridor_orientation if rp else None),
+                    lighting=o.lighting
                 ))
 
         session.query(NotamRunway).filter_by(notam_id=notam.id, airport_code=primary_ap.icao_code).delete()
@@ -426,7 +386,7 @@ def save_to_db(result, raw_text, notam_number, raw_hash, airport_code):
 
 # ----------------- batch/async orchestration -----------------
 
-async def run_analysis(to_analyze: List[Dict], batch_size=100, max_concurrency=8):
+async def run_analysis(to_analyze: List[Dict], batch_size=1000, max_concurrency=10):
     print(f"📦 Running analysis on {len(to_analyze)} new NOTAMs...")
 
     sem = asyncio.Semaphore(max_concurrency)

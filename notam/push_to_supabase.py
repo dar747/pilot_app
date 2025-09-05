@@ -1,4 +1,4 @@
-# push_to_supabase.py
+# notam/push_to_supabase.py
 import os
 import sys
 from contextlib import contextmanager
@@ -271,13 +271,7 @@ def copy_children_and_links(s, src: NotamRecord, new: NotamRecord, existing_airp
                 height_amsl_ft=o.height_amsl_ft,
                 latitude=o.latitude,
                 longitude=o.longitude,
-                lighting=o.lighting,
-                runway_id=o.runway_id,
-                reference_type=o.reference_type,
-                offset_distance_m=o.offset_distance_m,
-                offset_direction=o.offset_direction,
-                lateral_half_width_m=o.lateral_half_width_m,
-                corridor_orientation=o.corridor_orientation,
+                lighting=o.lighting
             )
         )
 
@@ -357,7 +351,6 @@ def push_to_supabase(overwrite=False):
                     start_time=src.start_time,
                     end_time=src.end_time,
                     operational_instance=src.operational_instance,
-                    time_classification=src.time_classification,
 
                     time_of_day_applicability=src.time_of_day_applicability,
                     flight_rule_applicability=src.flight_rule_applicability,
