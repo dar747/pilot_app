@@ -12,12 +12,14 @@ from notam.db import (
     NotamRecord, Airport, OperationalTag, NotamHistory,
     NotamWingspanRestriction, NotamTaxiway, NotamProcedure, NotamObstacle,
     NotamRunway, NotamRunwayCondition, NotamFlightPhase,
-    SeverityLevelEnum, TimeOfDayApplicabilityEnum,
-    FlightRuleApplicabilityEnum, AircraftSizeEnum, AircraftPropulsionEnum,
-    PrimaryCategoryEnum, NotamCategoryEnum, FlightPhaseEnum,
     notam_aircraft_propulsions, notam_aircraft_sizes,
 )
 from notam.scoring import compute_base_score
+from notam.core.enums import (
+    SeverityLevelEnum, TimeOfDayApplicabilityEnum,
+    FlightRuleApplicabilityEnum, AircraftSizeEnum, AircraftPropulsionEnum,
+    PrimaryCategoryEnum, NotamCategoryEnum, FlightPhaseEnum
+)
 
 log = logging.getLogger(__name__)
 

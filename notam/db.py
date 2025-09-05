@@ -4,7 +4,13 @@ from __future__ import annotations
 import enum
 import os
 from contextlib import contextmanager
-
+# Remove all the enum class definitions and replace with:
+from notam.core.enums import (
+    NotamCategoryEnum, SeverityLevelEnum, TimeClassificationEnum,
+    TimeOfDayApplicabilityEnum, FlightRuleApplicabilityEnum,
+    AircraftSizeEnum, AircraftPropulsionEnum, FlightPhaseEnum,
+    PrimaryCategoryEnum
+)
 from sqlalchemy import (
     create_engine, Column, String, Integer, Float, Boolean, Text, DateTime,
     ForeignKey, Table, JSON, Index, UniqueConstraint, Enum, CheckConstraint,
@@ -52,77 +58,6 @@ def get_session():
         raise
     finally:
         session.close()
-
-
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-class NotamCategoryEnum(str, enum.Enum):
-    FIR = "FIR"
-    AIRPORT = "AIRPORT"
-
-class SeverityLevelEnum(str, enum.Enum):
-    CRITICAL = "CRITICAL"
-    OPERATIONAL = "OPERATIONAL"
-    ADVISORY = "ADVISORY"
-
-class TimeClassificationEnum(str, enum.Enum):
-    PERMANENT = "PERMANENT"
-    LONG_TERM = "LONG_TERM"
-    MEDIUM_TERM = "MEDIUM_TERM"
-    SHORT_TERM = "SHORT_TERM"
-    DAILY = "DAILY"
-    WEEKLY = "WEEKLY"
-    MONTHLY = "MONTHLY"
-    EVENT_SPECIFIC = "EVENT_SPECIFIC"
-
-class TimeOfDayApplicabilityEnum(str, enum.Enum):
-    DAY = "DAY ONLY"
-    NIGHT = "NIGHT ONLY"
-    ALL = "ALL TIMES"
-
-class FlightRuleApplicabilityEnum(str, enum.Enum):
-    VFR_ONLY = "VFR ONLY"
-    IFR_ONLY = "IFR ONLY"
-    ALL = "ALL RULES"
-
-class AircraftSizeEnum(str, enum.Enum):
-    ALL = "ALL"
-    LIGHT = "LIGHT"
-    MEDIUM = "MEDIUM"
-    HEAVY = "HEAVY"
-    SUPER = "SUPER"
-
-class AircraftPropulsionEnum(str, enum.Enum):
-    ALL = "ALL"
-    JET = "JET"
-    TURBOPROP = "TURBOPROP"
-    PISTON = "PISTON"
-    HELICOPTER = "HELICOPTER"
-
-class FlightPhaseEnum(str, enum.Enum):
-    PREFLIGHT = "PREFLIGHT"
-    TAXI = "TAXI"
-    TAKEOFF = "TAKEOFF"
-    DEPARTURE = "DEPARTURE"
-    CRUISE = "CRUISE"
-    APPROACH = "APPROACH"
-    ARRIVAL = "ARRIVAL"
-    GROUND_OPS = "GROUND_OPS"
-    ALL_PHASES = "ALL_PHASES"
-
-class PrimaryCategoryEnum(str, enum.Enum):
-    RUNWAY_OPERATIONS = "RUNWAY_OPERATIONS"
-    AERODROME_OPERATIONS = "AERODROME_OPERATIONS"
-    NAVAIDS_SID_STAR_APPROACH_PROCEDURES = "NAVAIDS_SID_STAR_APPROACH_PROCEDURES"
-    FLOW_CONTROL = "FLOW_CONTROL"
-    COMMUNICATION_SERVICES = "COMMUNICATION_SERVICES"
-    OBSTACLES = "OBSTACLES"
-    RESTRICTED_AREA = "RESTRICTED_AREA"
-    ROUTING = "ROUTING"
-    MILITARY_ACTIVITY = "MILITARY_ACTIVITY"
-
 
 # ---------------------------------------------------------------------------
 # Association (pure many-to-many) Tables
