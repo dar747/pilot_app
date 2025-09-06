@@ -26,7 +26,7 @@ from notam.db import (
 load_dotenv()
 
 LOCAL_DB_URL = os.getenv("LOCAL_DB_URL")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_DEV_URL")
 
 if not LOCAL_DB_URL:
     print("❌ LOCAL_DB_URL missing.")

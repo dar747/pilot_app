@@ -5,6 +5,9 @@ import signal
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+import threading, time
+from notam.core.repository import NotamRepository
+from notam.services.analyser import analyze_many
 
 from solace.messaging.messaging_service import MessagingService, RetryStrategy
 from solace.messaging.receiver.persistent_message_receiver import PersistentMessageReceiver
@@ -145,6 +148,7 @@ def _ack_message(msg):
 
 class SwimConsumer:
     def __init__(self):
+        self.repository = NotamRepository()
         # Required connection bits
         self.host = _env("SWIM_HOST", required=True)  # e.g. tcps://ems1.swim.faa.gov:55443
         self.vpn = _env("SWIM_VPN", required=True)  # AIM_FNS
@@ -226,9 +230,7 @@ class SwimConsumer:
         log.info("Receiver started on queue: %s", self.queue)
 
     def run(self):
-        import threading, time
-        from notam.services.persistence import get_hash, save_results_batch
-        from notam.services.analyser import analyze_many
+
 
         inflight_lock = threading.Lock()
         last_flush = time.monotonic()
@@ -267,7 +269,7 @@ class SwimConsumer:
                     "airport": fields.get("airport") or "UNKNOWN",
                     "url": "SWIM:AIM_FNS",
                 }
-                item["raw_hash"] = get_hash(item["notam_number"], item["icao_message"])
+                item["raw_hash"] = self.repository.get_hash(item["notam_number"], item["icao_message"])
 
                 with inflight_lock:
                     self._msgs.append(item)
@@ -331,7 +333,7 @@ class SwimConsumer:
                         )
                     )
 
-                    save_results_batch(results)
+                    self.repository.save_batch(results)
                     log.info(
                         "Saved batch: %d ok / %d errors",
                         sum(1 for r in results if r.get("result") is not None),

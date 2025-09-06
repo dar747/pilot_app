@@ -1,36 +1,59 @@
+# alembic/env.py - Update to use your environment variables
+
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 import os
 from dotenv import load_dotenv
-from pathlib import Path
 
-# Load environment variables from the .env file
-# If your .env is outside the project root, point to it explicitly:
-# load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 load_dotenv()
 
-# 👇 make Alembic see your models
+# Import your models
 from notam.db import Base
 
-# Alembic Config object
 config = context.config
 
-# 👇 Ensure sqlalchemy.url is set from env even if alembic.ini uses ${LOCAL_DB_URL}
-db_url = os.getenv("LOCAL_DB_URL")
-if db_url:
-    config.set_main_option("sqlalchemy.url", db_url)
-else:
-    raise RuntimeError("LOCAL_DB_URL is not set. Make sure your .env is loaded or set the var.")
+
+# Use the same logic as your main app
+def get_alembic_database_url():
+    """Get database URL for Alembic based on environment"""
+    env = os.getenv("ENVIRONMENT", "development")
+
+    if env == "production":
+        db_url = os.getenv("SUPABASE_DB_URL")
+        if not db_url:
+            raise RuntimeError("SUPABASE_DB_URL required for production")
+        print(f"🎯 Alembic: Targeting production Supabase")
+
+    elif env == "development":
+        # Prefer dev Supabase, fallback to local
+        db_url = os.getenv("SUPABASE_DB_DEV_URL") or os.getenv("LOCAL_DB_URL")
+        if not db_url:
+            raise RuntimeError("SUPABASE_DB_DEV_URL or LOCAL_DB_URL required")
+
+        if "supabase.co" in (db_url or ""):
+            print(f"🎯 Alembic: Targeting dev Supabase")
+        else:
+            print(f"🎯 Alembic: Targeting local database")
+
+    else:
+        raise RuntimeError(f"Unknown environment: {env}")
+
+    return db_url
+
+
+# Set the database URL
+db_url = get_alembic_database_url()
+config.set_main_option("sqlalchemy.url", db_url)
 
 # Configure logging
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Autogenerate target
 target_metadata = Base.metadata
 
 
+# Rest of your alembic/env.py stays the same...
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
     url = config.get_main_option("sqlalchemy.url")
@@ -39,7 +62,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        render_as_batch=False,  # offline batch not needed unless you target SQLite
+        render_as_batch=False,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -53,11 +76,10 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        is_sqlite = connection.dialect.name == "sqlite"
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            render_as_batch=is_sqlite,  # only needed for SQLite
+            render_as_batch=False,
         )
         with context.begin_transaction():
             context.run_migrations()
