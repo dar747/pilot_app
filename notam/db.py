@@ -28,8 +28,46 @@ load_dotenv()  # does nothing if no .env present
 # Engine & Session
 # ---------------------------------------------------------------------------
 
-# Example: "postgresql+psycopg2://user:pass@localhost:5432/notamdb"
-DATABASE_URL = os.getenv("LOCAL_DB_URL")
+
+def get_database_url():
+    """Get database URL based on environment and available configs"""
+    env = os.getenv("ENVIRONMENT", "development")
+
+    if env == "production":
+        # Production: Use production Supabase
+        db_url = os.getenv("SUPABASE_DB_URL")
+        if not db_url:
+            raise RuntimeError("SUPABASE_DB_URL required for production")
+        print(f"🎯 Production mode: Using production Supabase")
+
+    elif env == "development":
+        # Development: Prefer dev Supabase, fallback to local
+        db_url = os.getenv("SUPABASE_DB_DEV_URL") or os.getenv("LOCAL_DB_URL")
+        if not db_url:
+            raise RuntimeError("SUPABASE_DB_DEV_URL or LOCAL_DB_URL required for development")
+
+        if "supabase.co" in (db_url or ""):
+            host = db_url.split('@')[1].split('/')[0] if '@' in db_url else 'supabase'
+            print(f"🔌 Development mode: Using dev Supabase ({host})")
+        else:
+            print(f"🔌 Development mode: Using local database")
+
+    elif env == "staging":
+        # Staging: Could use dev Supabase or separate staging
+        db_url = os.getenv("SUPABASE_DB_STAGING_URL") or os.getenv("SUPABASE_DB_DEV_URL")
+        if not db_url:
+            raise RuntimeError("SUPABASE_DB_STAGING_URL or SUPABASE_DB_DEV_URL required for staging")
+        print(f"🔌 Staging mode: Using staging/dev Supabase")
+
+    else:
+        raise RuntimeError(f"Unknown environment: {env}")
+
+    return db_url
+
+
+# Get the database URL based on environment
+DATABASE_URL = get_database_url()
+
 
 engine = create_engine(
     DATABASE_URL,

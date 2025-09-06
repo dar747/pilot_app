@@ -89,7 +89,7 @@ class Notam_Analysis(BaseModel):
 
     # Temporal Information
     start_time: str = Field(description="Start time in ISO 8601 UTC format (B field)")
-    end_time: str = Field(None, description="End time in ISO 8601 UTC format (C field), store NULL if permanent NOTAM")
+    end_time: str = Field(None, description="End time in ISO 8601 UTC format (C field), store NULL if NOTAM if the NOTAM is permanent")
 
     # Applicability (enhanced)
     flight_phases: List[FlightPhase] = Field(description="Affected flight phases")
