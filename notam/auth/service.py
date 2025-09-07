@@ -1,4 +1,6 @@
 # notam/auth/service.py
+import requests
+import os
 from typing import Optional
 from fastapi import HTTPException, status
 from supabase import Client
@@ -165,22 +167,56 @@ class AuthService:
                 detail=f"Password reset failed: {str(e)}"
             )
 
+    # Quick fix - just replace the update_password method in notam/auth/service.py
+
     async def update_password(self, password_data: PasswordUpdate, access_token: str) -> AuthResponse:
-        """Update user password"""
+        """Update user password - FIXED VERSION"""
         try:
-            # Set the session token
-            self.client.auth.set_session(access_token, None)
+            # Validate token first
+            user_response = self.client.auth.get_user(access_token)
+            if not user_response.user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid or expired token"
+                )
 
-            response = self.client.auth.update_user({
-                "password": password_data.password
-            })
+            # Use direct REST API call instead of problematic set_session
 
-            if response.user:
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "apikey": os.getenv("SUPABASE_ANON_KEY")
+            }
+
+            data = {"password": password_data.password}
+
+            response = requests.put(
+                f"{os.getenv('SUPABASE_URL')}/auth/v1/user",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+
+            if response.status_code == 200:
                 return AuthResponse(success=True, message="Password updated successfully")
+            else:
+                try:
+                    error_detail = response.json().get("error_description", "Password update failed")
+                except:
+                    error_detail = f"HTTP {response.status_code}: Password update failed"
 
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=error_detail
+                )
+
+        except HTTPException:
+            raise
+        except requests.exceptions.RequestException as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Password update failed"
+                detail=f"Network error: {str(e)}"
             )
         except Exception as e:
             raise HTTPException(
