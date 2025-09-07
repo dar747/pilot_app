@@ -125,20 +125,7 @@ def format_notam(record: NotamRecord) -> Dict[str, Any]:
                 if (o.latitude is not None and o.longitude is not None) else None
             ),
             "lighting": o.lighting,
-            "runway_reference": (
-                {
-                    "runway_id": o.runway_id,
-                    "reference_type": o.reference_type,
-                    "offset_distance_m": o.offset_distance_m,
-                    "offset_direction": o.offset_direction,
-                    "lateral_half_width_m": o.lateral_half_width_m,
-                    "corridor_orientation": o.corridor_orientation,
-                }
-                if any([
-                    o.runway_id, o.reference_type, o.offset_distance_m,
-                    o.offset_direction, o.lateral_half_width_m, o.corridor_orientation
-                ]) else None
-            ),
+            # runway_reference section removed - fields don't exist anymore
         })
 
     return {
