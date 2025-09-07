@@ -6,11 +6,15 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from sqlalchemy import create_engine, or_
 from sqlalchemy.orm import sessionmaker, selectinload
+
+# Import auth components
+from notam.auth import auth_router, get_current_user, get_optional_user, AuthUser
 
 from notam.generate_briefing import briefing_chain
 from notam.db import (
@@ -19,9 +23,9 @@ from notam.db import (
 )
 
 # -------------------- DB setup --------------------
-DATABASE_URL = os.getenv("SUPABASE_DB_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_DEV_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is empty. Set LOCAL_DB_URL (or wire SUPABASE_DB_URL + fallback).")
+    raise RuntimeError("Set DATABASE_URL (or SUPABASE_DB_DEV_URL).")
 
 engine = create_engine(
     DATABASE_URL,
@@ -29,19 +33,29 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
-    pool_recycle=1800,   # recycle idle conns every 30 min
+    pool_recycle=1800,  # recycle idle conns every 30 min
     pool_timeout=30,
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 print(f"🔌 Using DATABASE_URL: {DATABASE_URL}")
 
 # -------------------- App --------------------
-app = FastAPI(title="NOTAM Analysis API", version="1.0.0")
+app = FastAPI(
+    title="NOTAM Analysis API",
+    version="1.0.0",
+    description="Professional aviation NOTAM analysis and briefing system with user authentication"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],  # tighten in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+# Include authentication routes
+app.include_router(auth_router)
 
 # -------------------- Helpers --------------------
 def _enum_val(v):
@@ -55,7 +69,6 @@ def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 def _z(dt: Optional[datetime]) -> Optional[str]:
-    """UTC datetime -> 'YYYY-MM-DDTHH:MM:SSZ' string (or None)."""
     if dt is None:
         return None
     return _to_utc(dt).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -63,7 +76,6 @@ def _z(dt: Optional[datetime]) -> Optional[str]:
 def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
-    # Accept Z or offset
     st = s.strip()
     if st.endswith(("Z", "z")):
         st = st[:-1] + "+00:00"
@@ -74,13 +86,11 @@ def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
     return _to_utc(dt)
 
 def _is_active_now(record: NotamRecord, now_utc: datetime) -> bool:
-    # Coarse gates
     if record.start_time and record.start_time > now_utc:
         return False
     if record.end_time and record.end_time < now_utc:
         return False
 
-    # If operational instances exist, require at least one interval that covers now
     ops = (record.operational_instance or {}).get("operational_instances") or []
     if ops:
         for sl in ops:
@@ -88,14 +98,13 @@ def _is_active_now(record: NotamRecord, now_utc: datetime) -> bool:
             e = _parse_iso_utc(sl.get("end_iso"))
             if s and e and s <= now_utc <= e:
                 return True
-        return False  # had instances, but none cover "now"
-    return True  # no instances → fall back to coarse window
+        return False
+    return True
 
 def format_notam(record: NotamRecord) -> Dict[str, Any]:
     def designator(r):
         return f"{r.runway_number}{r.runway_side or ''}"
 
-    # Runways + condition match
     affected_runways = []
     rc_map = {(c.runway_number, c.runway_side): c for c in record.runway_conditions}
     for r in record.runways:
@@ -105,7 +114,6 @@ def format_notam(record: NotamRecord) -> Dict[str, Any]:
             "friction_value": getattr(cond, "friction_value", None) if cond else None,
         })
 
-    # Obstacles
     obstacles = []
     for o in record.obstacles:
         obstacles.append({
@@ -174,22 +182,31 @@ def format_notam(record: NotamRecord) -> Dict[str, Any]:
         "base_score_ifr": record.base_score_ifr,
     }
 
-# -------------------- Routes --------------------
+# -------------------- Public Routes --------------------
 @app.get("/")
 def root():
-    return {"message": "✅ NOTAM API is running. Use /notams to query."}
+    return {
+        "message": "✅ NOTAM API is running. Use /auth/signin to login, then /notams to query.",
+        "version": "1.0.0",
+        "auth_required": True
+    }
 
 @app.get("/ping")
 def ping():
-    return {"message": "pong"}
+    return {"message": "pong", "timestamp": datetime.now().isoformat()}
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "service": "NOTAM Analysis API"}
+
+# -------------------- Protected Routes (auth required) --------------------
 @app.get("/check-db")
-def check_db_connection():
+def check_db_connection(current_user: AuthUser = Depends(get_current_user)):
     session = SessionLocal()
     try:
         db_url = str(session.get_bind().url)
         count = session.query(NotamRecord).count()
-        return {"message": "✅ DB OK", "record_count": count, "connected_to": db_url}
+        return {"message": "✅ DB OK", "record_count": count, "connected_to": db_url, "user": current_user.email}
     except Exception as e:
         return {"error": str(e)}
     finally:
@@ -198,20 +215,19 @@ def check_db_connection():
 @app.get("/airports/{airport}/notams", response_model=List[dict])
 def list_notams_for_airport(
     airport: str,
+    current_user: AuthUser = Depends(get_current_user),
     notam_category: Optional[NotamCategoryEnum] = Query(None, description="FIR or AIRPORT"),
     primary_category: Optional[PrimaryCategoryEnum] = Query(None),
     start_time_after: Optional[datetime] = Query(None, description="UTC time"),
     end_time_before: Optional[datetime] = Query(None, description="UTC time"),
     active_only: bool = Query(False, description="Coarse window + operational_instances"),
-    include_inactive: bool = Query(False, description="Include replaced/cancelled NOTAMs"),  # NEW
+    include_inactive: bool = Query(False, description="Include replaced/cancelled NOTAMs"),
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
     session = SessionLocal()
     try:
-        # --- build coarse filters once ---
         def apply_coarse_filters(q):
-
             if not include_inactive:
                 q = q.filter(NotamRecord.is_active == True)
             if notam_category:
@@ -225,18 +241,15 @@ def list_notams_for_airport(
                                  NotamRecord.end_time.is_(None)))
             return q
 
-        # --- page by IDs to avoid duplicates from the airport M2M join ---
         ids_subq = (
             session.query(NotamRecord.id)
             .join(NotamRecord.airports)
             .filter(Airport.icao_code == airport.upper())
-            .distinct(NotamRecord.id)   # DISTINCT ON (id)
+            .distinct(NotamRecord.id)
         )
         ids_subq = apply_coarse_filters(ids_subq)
-
-        # IMPORTANT: when using DISTINCT ON (id), id must be the first ORDER BY term
         ids_subq = ids_subq.order_by(
-            NotamRecord.id,                 # matches DISTINCT ON
+            NotamRecord.id,
             NotamRecord.start_time.desc(),
             NotamRecord.issue_time.desc(),
         ).offset(offset).limit(limit * (3 if active_only else 1))
@@ -245,7 +258,6 @@ def list_notams_for_airport(
         if not id_rows:
             return []
 
-        # --- fetch full rows with efficient eager loading ---
         q = (
             session.query(NotamRecord)
             .filter(NotamRecord.id.in_(id_rows))
@@ -263,33 +275,91 @@ def list_notams_for_airport(
         )
         rows = q.all()
 
-        # --- exact-time filter using operational_instances (Python side) ---
         if active_only:
             now_utc = datetime.now(timezone.utc)
             rows = [r for r in rows if _is_active_now(r, now_utc)]
 
-        # Restore deterministic sort (IN() doesn’t preserve order)
         rows.sort(key=lambda r: (
             r.start_time or datetime.min.replace(tzinfo=timezone.utc),
             r.issue_time or datetime.min.replace(tzinfo=timezone.utc),
             r.id
         ), reverse=True)
 
-        # final page size
         rows = rows[:limit]
         return [format_notam(n) for n in rows]
     finally:
         session.close()
 
 @app.get("/briefing-from-input")
-async def get_briefing_from_input(query: str):
-    return await briefing_chain(query)
+async def get_briefing_from_input(
+    query: str,
+    current_user: AuthUser = Depends(get_current_user)
+):
+    try:
+        result = await briefing_chain(query)
+        return {"briefing": result, "generated_for": current_user.email, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Briefing generation failed: {str(e)}")
 
 @app.get("/enums/primary-categories", response_model=List[str])
-def list_primary_categories():
+def list_primary_categories(current_user: AuthUser = Depends(get_current_user)):
     return [e.value for e in PrimaryCategoryEnum]
 
 @app.get("/enums/notam-categories", response_model=List[str])
-def list_notam_categories():
-    from notam.db import NotamCategoryEnum
+def list_notam_categories(current_user: AuthUser = Depends(get_current_user)):
     return [e.value for e in NotamCategoryEnum]
+
+# -------------------- Optional Auth Routes --------------------
+@app.get("/airports", response_model=List[dict])
+def list_airports(
+    current_user: Optional[AuthUser] = Depends(get_optional_user),
+    limit: int = Query(100, ge=1, le=1000),
+    search: Optional[str] = Query(None, description="Search by ICAO code or name")
+):
+    session = SessionLocal()
+    try:
+        query = session.query(Airport)
+        if search:
+            search_term = f"%{search.upper()}%"
+            query = query.filter(or_(Airport.icao_code.ilike(search_term), Airport.name.ilike(search_term)))
+
+        airports = query.limit(limit).all()
+
+        result = []
+        for airport in airports:
+            airport_data = {
+                "icao_code": airport.icao_code,
+                "name": airport.name,
+                "country": airport.country,
+            }
+            if current_user:
+                airport_data.update({
+                    "iata_code": airport.iata_code,
+                    "coordinates": {
+                        "lat": airport.lat,
+                        "lon": airport.lon,
+                        "elevation": airport.elev
+                    } if airport.lat and airport.lon else None,
+                    "timezone": airport.timezone,
+                })
+            result.append(airport_data)
+
+        return result
+    finally:
+        session.close()
+
+# -------------------- Error Handlers --------------------
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8080)
