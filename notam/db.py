@@ -300,6 +300,7 @@ class NotamRecord(Base):
     start_time = Column(DateTime(timezone=True), nullable=False, index=True)  # CHANGED
     end_time = Column(DateTime(timezone=True), index=True)
     operational_instance = Column(JSON)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
 
     # Applicability
     time_of_day_applicability = Column(Enum(TimeOfDayApplicabilityEnum, native_enum=False))
@@ -438,6 +439,24 @@ class NotamHistory(Base):
         Index('idx_history_notam_time', 'notam_id', 'timestamp'),
     )
 
+
+class FailedNotam(Base):
+    __tablename__ = "failed_notams"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notam_number = Column(String(50), nullable=False, index=True)
+    icao_message = Column(Text, nullable=False)
+    airport = Column(String(4), nullable=False, index=True)
+    issue_time = Column(String(100), nullable=True)
+    raw_hash = Column(String(64), nullable=False, index=True)
+    failure_reason = Column(Text, nullable=True)
+    retry_count = Column(Integer, default=0, nullable=False)
+    last_retry_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index('idx_failed_notams_retry', 'retry_count', 'last_retry_at'),
+    )
 
 def _ensure_bounds_from_instances(target: "NotamRecord") -> None:
     """

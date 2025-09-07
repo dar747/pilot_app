@@ -203,6 +203,7 @@ def list_notams_for_airport(
     start_time_after: Optional[datetime] = Query(None, description="UTC time"),
     end_time_before: Optional[datetime] = Query(None, description="UTC time"),
     active_only: bool = Query(False, description="Coarse window + operational_instances"),
+    include_inactive: bool = Query(False, description="Include replaced/cancelled NOTAMs"),  # NEW
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
@@ -210,6 +211,9 @@ def list_notams_for_airport(
     try:
         # --- build coarse filters once ---
         def apply_coarse_filters(q):
+
+            if not include_inactive:
+                q = q.filter(NotamRecord.is_active == True)
             if notam_category:
                 q = q.filter(NotamRecord.notam_category == notam_category.value)
             if primary_category:

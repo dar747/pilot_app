@@ -116,6 +116,47 @@ def parse_runway_id(runway_id: str) -> Tuple[Optional[int], Optional[str]]:
     except ValueError:
         return None, side
 
+
+def save_failed_notam(item: Dict, error_reason: str):
+    """Store failed NOTAM for later retry"""
+    from notam.db import FailedNotam
+
+    session = SessionLocal()
+    try:
+        # Check if this exact failure already exists
+        existing = session.query(FailedNotam).filter_by(
+            raw_hash=item["raw_hash"]
+        ).first()
+
+        if existing:
+            # Update existing record
+            existing.retry_count += 1
+            existing.failure_reason = error_reason
+            existing.last_retry_at = datetime.now(timezone.utc)
+            log.info("⏭️ Updated retry count for %s (attempts: %d)",
+                     item["notam_number"], existing.retry_count)
+        else:
+            # Create new failed record
+            failed = FailedNotam(
+                notam_number=item["notam_number"],
+                icao_message=item["icao_message"],
+                airport=item.get("airport", "UNKNOWN"),
+                issue_time=item.get("issue_time"),
+                raw_hash=item["raw_hash"],
+                failure_reason=error_reason,
+                retry_count=1,
+                last_retry_at=datetime.now(timezone.utc)
+            )
+            session.add(failed)
+            log.info("💾 Stored failed NOTAM %s for retry", item["notam_number"])
+
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        log.exception("❌ Failed to store failed NOTAM: %s", e)
+    finally:
+        session.close()
+
 def save_to_db(
     result,
     raw_text: str,
@@ -314,6 +355,26 @@ def save_to_db(
             changed_fields={"updated_at": datetime.now(timezone.utc).isoformat()} if is_update else {}
         ))
 
+        # Handle NOTAM replacements - match both number AND airport
+        if result.replacing_notam:
+            # Find old NOTAM with same number at the same airport
+            old_notam = session.query(NotamRecord).join(
+                NotamRecord.airports
+            ).filter(
+                NotamRecord.notam_number == result.replacing_notam,
+                Airport.icao_code == airport_code,  # Must be same airport
+                NotamRecord.is_active == True  # Only mark active ones as replaced
+            ).first()
+
+            if old_notam:
+                old_notam.is_active = False
+                session.flush()
+                log.info("🔄 Marked %s at %s as inactive (replaced by %s)",
+                         result.replacing_notam, airport_code, notam_number)
+            else:
+                log.warning("⚠️ Could not find active NOTAM %s at %s to replace",
+                            result.replacing_notam, airport_code)
+
         # finalize write
         if autocommit:
             session.commit()
@@ -343,36 +404,33 @@ def save_to_db(
 
 
 def save_results_batch(
-    batch_results: List[Dict],
-    *,
-    overwrite_all: bool = False,
-    overwrite_db_ids: Optional[Iterable[int]] = None,
-        ):
-    """
-    Persist a batch in a single outer transaction.
-    Each item is wrapped in a SAVEPOINT (begin_nested), so failures don't
-    abort the whole batch.
-    batch_results items are {'input': item, 'result': pydantic_or_None, 'error': str_or_None}
-    """
+        batch_results: List[Dict],
+        *,
+        overwrite_all: bool = False,
+        overwrite_db_ids: Optional[Iterable[int]] = None,
+):
+    """Persist a batch in a single outer transaction."""
     session = SessionLocal()
     try:
-        # Outer transaction (committed once at the end)
         with session.begin():
             if overwrite_all:
-                truncate_all_notams(session,restart_identity=False)
+                truncate_all_notams(session, restart_identity=False)
             elif overwrite_db_ids:
                 delete_notams_by_ids(session, overwrite_db_ids)
-
 
             for r in batch_results:
                 item = r["input"]
                 res = r["result"]
+                error = r["error"]
+
                 if res is None:
-                    log.error("Skipping %s due to analysis error: %s", item.get("notam_number"), r["error"])
+                    log.error("Skipping %s due to analysis error: %s",
+                              item.get("notam_number"), error)
+                    # NEW: Store failed NOTAM for retry
+                    save_failed_notam(item, error or "unknown_error")
                     continue
 
                 try:
-                    # SAVEPOINT per item
                     with session.begin_nested():
                         save_to_db(
                             result=res,
@@ -381,14 +439,15 @@ def save_results_batch(
                             raw_hash=item["raw_hash"],
                             airport_code=item.get("airport", "Unknown"),
                             session=session,
-                            autocommit=False,  # defer; outer ctx manages commit
+                            autocommit=False,
                         )
                 except IntegrityError:
-                    log.warning("⚠️ Skipped %s due to integrity error", item.get("notam_number"))
+                    log.warning("⚠️ Skipped %s due to integrity error",
+                                item.get("notam_number"))
                 except Exception:
-                    log.exception("❌ Skipped %s due to DB error", item.get("notam_number"))
+                    log.exception("❌ Skipped %s due to DB error",
+                                  item.get("notam_number"))
 
-        # if we reach here, outer transaction committed successfully
     except Exception:
         log.exception("❌ Batch save failed")
         raise
