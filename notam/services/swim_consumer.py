@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 import threading, time
 from notam.core.repository import NotamRepository
 from notam.services.analyser import analyze_many
-
+from notam.services.retry_failed import FailedNotamRetryService
 from solace.messaging.messaging_service import MessagingService, RetryStrategy
 from solace.messaging.receiver.persistent_message_receiver import PersistentMessageReceiver
 from solace.messaging.receiver.message_receiver import MessageReceiver
@@ -157,6 +157,14 @@ class SwimConsumer:
         self.queue = _env("SWIM_QUEUE", required=True)
         self.trust = _env("SWIM_TRUST_STORE_PEM", required=True)  # DIRECTORY with PEM/CRT
 
+        # NEW: Auto-retry configuration
+        self.retry_service = FailedNotamRetryService(
+            max_retry_attempts=3,
+            retry_delay_hours=1  # Wait 1 hour before retrying
+        )
+        self.auto_retry_interval_sec = int(_env("SWIM_AUTO_RETRY_INTERVAL_SEC", "1800"))  # 30 minutes default
+        self.retry_batch_size = int(_env("SWIM_RETRY_BATCH_SIZE", "10"))
+
         # Micro-batch tuning (small for quick feedback)
         self.batch_size = int(_env("SWIM_BATCH_SIZE", "3"))
         self.batch_secs = float(_env("SWIM_BATCH_INTERVAL_SEC", "2"))
@@ -298,16 +306,17 @@ class SwimConsumer:
         def flush_loop():
             nonlocal last_flush
             batch_count = 0
+            last_retry = time.monotonic()  # NEW: Track last retry time
 
             while not self._stop:
                 time.sleep(0.5)
                 now = time.monotonic()
-                do_time = (now - last_flush) >= self.batch_secs
 
+                # Existing batch processing logic
+                do_time = (now - last_flush) >= self.batch_secs
                 with inflight_lock:
                     current_size = len(self._msgs)
                     do_size = current_size >= self.batch_size
-
                     if do_size or (do_time and self._msgs):
                         batch = self._msgs
                         self._msgs = []
@@ -316,32 +325,45 @@ class SwimConsumer:
                     else:
                         batch = None
 
-                if not batch:
-                    continue
-
-                try:
-                    log.info("Analyzing batch of %d NOTAMs…", len(batch))
-
-                    import asyncio
-                    results = asyncio.run(
-                        analyze_many(
-                            batch,
-                            max_concurrency=80,
-                            rps=8.0,
-                            timeout_sec=120.0,
-                            retry_attempts=1,
+                # Process regular batch (existing code)
+                if batch:
+                    try:
+                        log.info("Analyzing batch of %d NOTAMs…", len(batch))
+                        import asyncio
+                        results = asyncio.run(
+                            analyze_many(
+                                batch,
+                                max_concurrency=80,
+                                rps=8.0,
+                                timeout_sec=120.0,
+                                retry_attempts=3,
+                            )
                         )
-                    )
+                        self.repository.save_batch(results)
+                        log.info(
+                            "Saved batch: %d ok / %d errors",
+                            sum(1 for r in results if r.get("result") is not None),
+                            sum(1 for r in results if r.get("result") is None),
+                        )
+                    except Exception as e:
+                        log.exception("Batch analyze/save failed: %s", e)
 
-                    self.repository.save_batch(results)
-                    log.info(
-                        "Saved batch: %d ok / %d errors",
-                        sum(1 for r in results if r.get("result") is not None),
-                        sum(1 for r in results if r.get("result") is None),
-                    )
+                # NEW: Auto-retry failed NOTAMs at intervals
+                should_retry = (now - last_retry) >= self.auto_retry_interval_sec
+                if should_retry:
+                    last_retry = now
+                    try:
+                        log.info("🔄 Starting automatic retry of failed NOTAMs...")
+                        import asyncio
+                        asyncio.run(
+                            self.retry_service.retry_failed_notams(
+                                batch_size=self.retry_batch_size
+                            )
+                        )
+                    except Exception as e:
+                        log.exception("❌ Auto-retry failed: %s", e)
 
-                except Exception as e:
-                    log.exception("Batch analyze/save failed: %s", e)
+
 
         t = threading.Thread(target=flush_loop, daemon=True)
         t.start()

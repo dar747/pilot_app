@@ -113,7 +113,7 @@ class Notam_Analysis(BaseModel):
     one_line_description: str = Field(description="One line description of the nature of the NOTAM event")
 
     # Administrative
-    replacing_notam: Optional[str] = Field(None, description="NOTAM number this notice replaces")
+    replacing_notam: Optional[str] = Field(None, description="NOTAM number this notice replaces or cancels")
 
 
     class Config:

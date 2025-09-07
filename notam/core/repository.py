@@ -26,6 +26,8 @@ class NotamRepository:
 
     def save_batch(self, batch_results: List[Dict]) -> None:
         """Save batch of analyzed NOTAMs"""
+        from notam.services.persistence import save_results_batch
+        save_results_batch(batch_results)
         # Move from persistence.py
 
     def delete_by_ids(self, ids: List[int]) -> int:
