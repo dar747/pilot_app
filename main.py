@@ -148,7 +148,6 @@ def format_notam(record: NotamRecord) -> Dict[str, Any]:
         "notam_category": _enum_val(record.notam_category),
         "start_time": _z(record.start_time),
         "end_time": _z(record.end_time),
-        "time_classification": _enum_val(record.time_classification),
         "time_of_day_applicability": _enum_val(record.time_of_day_applicability),
         "flight_rule_applicability": _enum_val(record.flight_rule_applicability),
         "primary_category": _enum_val(record.primary_category),
