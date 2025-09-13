@@ -5,7 +5,7 @@ from .service import auth_service
 from .middleware import get_current_user, security, AuthUser
 from .models import (
     UserSignUp, UserSignIn, PasswordReset, PasswordUpdate,
-    AuthResponse, TokenResponse, UserProfile, UserUpdate, TokenRefresh
+    AuthResponse, TokenResponse, UserProfile, UserUpdate, TokenRefresh, PasswordResetWithCode,
 )
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -69,3 +69,12 @@ async def verify_token(current_user: AuthUser = Depends(get_current_user)):
         "role": current_user.role,
         "expires_at": current_user.exp
     }
+
+@router.post("/verify-reset-code", response_model=AuthResponse)
+async def verify_reset_code(reset_data: PasswordResetWithCode):
+    """Verify code and reset password"""
+    return await auth_service.verify_reset_code(
+        reset_data.email,
+        reset_data.code,
+        reset_data.new_password
+    )

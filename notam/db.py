@@ -458,6 +458,19 @@ class FailedNotam(Base):
         Index('idx_failed_notams_retry', 'retry_count', 'last_retry_at'),
     )
 
+class PasswordResetCode(Base):
+    __tablename__ = "password_reset_codes"
+
+    email = Column(String(255), primary_key=True)
+    code = Column(String(6), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index('idx_password_reset_expires', 'expires_at'),
+    )
+
+
 def _ensure_bounds_from_instances(target: "NotamRecord") -> None:
     """
     If operational_instance.operational_instances exists, set:
@@ -507,6 +520,6 @@ __all__ = [
     # models
     "NotamRecord", "Airport", "OperationalTag", "NotamHistory",
     "NotamWingspanRestriction", "NotamTaxiway", "NotamProcedure", "NotamObstacle",
-    "NotamRunway", "NotamRunwayCondition", "NotamFlightPhase",
+    "NotamRunway", "NotamRunwayCondition", "NotamFlightPhase","PasswordResetCode",
 
 ]

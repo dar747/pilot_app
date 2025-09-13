@@ -21,6 +21,8 @@ from notam.db import (
     NotamRecord, Airport, OperationalTag,
     NotamCategoryEnum, PrimaryCategoryEnum,
 )
+from pydantic import BaseModel
+from typing import Optional
 
 # -------------------- DB setup --------------------
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_DEV_URL")
@@ -286,6 +288,8 @@ async def get_briefing_from_input(
         return {"briefing": result, "generated_for": current_user.email, "timestamp": datetime.now().isoformat()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Briefing generation failed: {str(e)}")
+
+
 
 @app.get("/enums/primary-categories", response_model=List[str])
 def list_primary_categories(current_user: AuthUser = Depends(get_current_user)):
