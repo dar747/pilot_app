@@ -9,10 +9,29 @@ from .models import (
     UserSignUp, UserSignIn, PasswordReset, PasswordUpdate,
     TokenResponse, UserProfile, AuthResponse
 )
+from notam.db import SessionLocal, PasswordResetCode  # Add this line
+from datetime import datetime, timezone, timedelta    # Add this line
+import random
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+import random
+from datetime import datetime, timezone, timedelta
+
 
 class AuthService:
     def __init__(self):
         self.client: Client = supabase_auth.get_client()
+    # ADD THIS METHOD RIGHT HERE ⬇️
+
+    def get_admin_client(self):
+        """Get Supabase client with admin privileges"""
+        from supabase import create_client
+        return create_client(
+            os.getenv("SUPABASE_URL"),
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Admin key
+        )
 
     async def sign_up(self, user_data: UserSignUp) -> AuthResponse:
         """Register a new user"""
@@ -122,12 +141,15 @@ class AuthService:
     async def sign_out(self, access_token: str, refresh_token: Optional[str] = None) -> AuthResponse:
         """Sign out user and invalidate token"""
         try:
-            # Scope client to caller's session before sign-out
-            self.client.auth.set_session(access_token, refresh_token)
+            # Only set session if we have both tokens, otherwise just sign out
+            if refresh_token:
+                self.client.auth.set_session(access_token, refresh_token)
+
             self.client.auth.sign_out()
             return AuthResponse(success=True, message="Logged out successfully")
         except Exception as e:
             return AuthResponse(success=False, message=f"Logout failed: {str(e)}")
+
 
     async def refresh_token(self, refresh_token: str) -> TokenResponse:
         """Refresh access token using a refresh token"""
@@ -153,24 +175,8 @@ class AuthService:
                 detail=f"Token refresh failed: {str(e)}"
             )
 
-    async def reset_password(self, reset_data: PasswordReset) -> AuthResponse:
-        """Send password reset email"""
-        try:
-            self.client.auth.reset_password_email(reset_data.email)
-            return AuthResponse(
-                success=True,
-                message="Password reset email sent. Please check your inbox."
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Password reset failed: {str(e)}"
-            )
-
-    # Quick fix - just replace the update_password method in notam/auth/service.py
-
     async def update_password(self, password_data: PasswordUpdate, access_token: str) -> AuthResponse:
-        """Update user password - FIXED VERSION"""
+        """Update password for logged-in user"""
         try:
             # Validate token first
             user_response = self.client.auth.get_user(access_token)
@@ -181,8 +187,6 @@ class AuthService:
                 )
 
             # Use direct REST API call instead of problematic set_session
-
-
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
@@ -222,6 +226,158 @@ class AuthService:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Password update failed: {str(e)}"
+            )
+
+    async def send_reset_email(self, email: str, code: str):
+        """Send 6-digit code via Gmail"""
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = os.getenv("SMTP_EMAIL")
+            msg['To'] = email
+            msg['Subject'] = "Your Pilot App Password Reset Code"
+
+            body = f"""
+    Hello,
+
+    Your password reset code is: {code}
+
+    This code will expire in 15 minutes.
+
+    If you didn't request this password reset, please ignore this email.
+
+    Best regards,
+    Pilot App Team
+            """
+
+            msg.attach(MIMEText(body, 'plain'))
+
+            await aiosmtplib.send(
+                msg,
+                hostname="smtp.gmail.com",
+                port=587,
+                start_tls=True,
+                username=os.getenv("SMTP_EMAIL"),
+                password=os.getenv("SMTP_PASSWORD")
+            )
+
+            print(f"📧 Reset code email sent to {email}")
+
+        except Exception as e:
+            print(f"❌ Email failed: {e}")
+            raise
+
+    async def reset_password(self, reset_data: PasswordReset) -> AuthResponse:
+        """Send 6-digit reset code to email"""
+        try:
+            # Generate 6-digit code
+            code = f"{random.randint(100000, 999999)}"
+            expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+            # Store in database
+            session = SessionLocal()
+            try:
+                session.query(PasswordResetCode).filter_by(email=reset_data.email).delete()
+
+                reset_code = PasswordResetCode(
+                    email=reset_data.email,
+                    code=code,
+                    expires_at=expires_at
+                )
+                session.add(reset_code)
+                session.commit()
+
+                # SEND REAL EMAIL 📧
+                await self.send_reset_email(reset_data.email, code)
+
+                return AuthResponse(
+                    success=True,
+                    message="6-digit reset code sent to your email"
+                )
+
+            finally:
+                session.close()
+
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Password reset failed: {str(e)}"
+            )
+
+    async def verify_reset_code(self, email: str, code: str, new_password: str) -> AuthResponse:
+        """Verify code and reset password directly in app"""
+        try:
+            session = SessionLocal()
+            try:
+                # Find the code
+                stored_code = session.query(PasswordResetCode).filter_by(email=email).first()
+
+                if not stored_code:
+                    raise HTTPException(status_code=400, detail="No reset code found for this email")
+
+                # Check if expired
+                if stored_code.expires_at < datetime.now(timezone.utc):
+                    session.delete(stored_code)
+                    session.commit()
+                    raise HTTPException(status_code=400, detail="Reset code has expired")
+
+                # Check if code matches
+                if stored_code.code != code:
+                    raise HTTPException(status_code=400, detail="Invalid reset code")
+
+                # Code is valid - update password using admin client
+                try:
+                    admin_client = self.get_admin_client()
+
+                    # CORRECTED: Use the right method names for your SDK version
+                    users_response = admin_client.auth.admin.list_users()
+                    target_user = None
+
+                    # Look through the users list to find matching email
+                    if hasattr(users_response, 'users'):
+                        users = users_response.users
+                    elif isinstance(users_response, list):
+                        users = users_response
+                    else:
+                        users = []
+
+                    for user in users:
+                        if user.email == email:
+                            target_user = user
+                            break
+
+                    if not target_user:
+                        raise HTTPException(status_code=400, detail="User not found")
+
+                    # Update password using admin privileges
+                    update_response = admin_client.auth.admin.update_user_by_id(
+                        target_user.id,
+                        {"password": new_password}
+                    )
+
+                    # Delete the used code
+                    session.delete(stored_code)
+                    session.commit()
+
+                    return AuthResponse(
+                        success=True,
+                        message="Password reset successfully! You can now login with your new password."
+                    )
+
+                except Exception as supabase_error:
+                    print(f"Supabase admin error: {supabase_error}")
+                    # Print more details for debugging
+                    print(f"Error type: {type(supabase_error)}")
+                    raise HTTPException(status_code=400, detail=f"Failed to update password: {str(supabase_error)}")
+
+            finally:
+                session.close()
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Code verification failed: {str(e)}"
             )
 
     async def get_user_profile(self, access_token: str) -> UserProfile:

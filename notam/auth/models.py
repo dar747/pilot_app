@@ -47,3 +47,8 @@ class AuthResponse(BaseModel):
     message: str
     user: Optional[UserProfile] = None
     tokens: Optional[TokenResponse] = None
+
+class PasswordResetWithCode(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str

@@ -24,7 +24,7 @@ os.environ["LANGCHAIN_PROJECT"] = "Pilot_App_Generate_Briefing"
 
 langsmith_client = Client()
 
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_DEV_URL")
 if not SUPABASE_DB_URL:
     raise ValueError("SUPABASE_DB_URL is not set in environment.")
 engine = create_engine(SUPABASE_DB_URL)
