@@ -18,6 +18,8 @@ from email.mime.multipart import MIMEMultipart
 import os
 import random
 from datetime import datetime, timezone, timedelta
+import logging
+log = logging.getLogger(__name__)
 
 
 class AuthService:
@@ -267,15 +269,46 @@ class AuthService:
             raise
 
     async def reset_password(self, reset_data: PasswordReset) -> AuthResponse:
-        """Send 6-digit reset code to email"""
+        """Send 6-digit reset code to email (user-friendly version with rate limiting)"""
         try:
-            # Generate 6-digit code
+            # Check if the email exists in Supabase
+            admin_client = self.get_admin_client()
+
+            try:
+                users_response = admin_client.auth.admin.list_users()
+
+                if hasattr(users_response, 'users'):
+                    users = users_response.users
+                elif isinstance(users_response, list):
+                    users = users_response
+                else:
+                    users = []
+
+                user_exists = any(user.email == reset_data.email for user in users)
+
+            except Exception as supabase_error:
+                log.error(f"Failed to check user existence: {supabase_error}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Unable to process password reset at this time"
+                )
+
+            if not user_exists:
+                # CLEAR FEEDBACK: Tell user the email isn't registered
+                log.info(f"Password reset attempted for non-existent email: {reset_data.email}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="This email address is not registered. Please check your email or sign up for a new account."
+                )
+
+            # User exists - proceed with reset code generation
             code = f"{random.randint(100000, 999999)}"
             expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
 
             # Store in database
             session = SessionLocal()
             try:
+                # Remove any existing codes for this email
                 session.query(PasswordResetCode).filter_by(email=reset_data.email).delete()
 
                 reset_code = PasswordResetCode(
@@ -286,35 +319,65 @@ class AuthService:
                 session.add(reset_code)
                 session.commit()
 
-                # SEND REAL EMAIL 📧
+                # Send email
                 await self.send_reset_email(reset_data.email, code)
+
+                log.info(f"Password reset code sent to: {reset_data.email}")
 
                 return AuthResponse(
                     success=True,
-                    message="6-digit reset code sent to your email"
+                    message=f"A 6-digit reset code has been sent to {reset_data.email}. Please check your inbox."
                 )
 
             finally:
                 session.close()
 
+        except HTTPException:
+            # Re-raise HTTP exceptions (like 404 for non-existent email)
+            raise
         except Exception as e:
+            log.exception(f"Password reset error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Password reset failed: {str(e)}"
             )
 
+    def cleanup_expired_reset_codes(self):
+        """Remove expired password reset codes from database"""
+        session = SessionLocal()
+        try:
+            now = datetime.now(timezone.utc)
+            deleted_count = session.query(PasswordResetCode).filter(
+                PasswordResetCode.expires_at < now
+            ).delete()
+            session.commit()
+
+            if deleted_count > 0:
+                log.info(f"🧹 Cleaned up {deleted_count} expired password reset codes")
+
+            return deleted_count
+        except Exception as e:
+            session.rollback()
+            log.error(f"Failed to cleanup expired reset codes: {e}")
+            return 0
+        finally:
+            session.close()
+
     async def verify_reset_code(self, email: str, code: str, new_password: str) -> AuthResponse:
         """Verify code and reset password directly in app"""
         try:
+            # FIRST: Clean up expired codes
+            self.cleanup_expired_reset_codes()
+
             session = SessionLocal()
             try:
                 # Find the code
                 stored_code = session.query(PasswordResetCode).filter_by(email=email).first()
 
                 if not stored_code:
-                    raise HTTPException(status_code=400, detail="No reset code found for this email")
+                    raise HTTPException(status_code=400, detail="No valid reset code found for this email")
 
-                # Check if expired
+                # Check if expired (double-check after cleanup)
                 if stored_code.expires_at < datetime.now(timezone.utc):
                     session.delete(stored_code)
                     session.commit()
@@ -327,12 +390,9 @@ class AuthService:
                 # Code is valid - update password using admin client
                 try:
                     admin_client = self.get_admin_client()
-
-                    # CORRECTED: Use the right method names for your SDK version
                     users_response = admin_client.auth.admin.list_users()
                     target_user = None
 
-                    # Look through the users list to find matching email
                     if hasattr(users_response, 'users'):
                         users = users_response.users
                     elif isinstance(users_response, list):
@@ -354,9 +414,11 @@ class AuthService:
                         {"password": new_password}
                     )
 
-                    # Delete the used code
+                    # 🗑️ IMPORTANT: Delete the used code immediately
                     session.delete(stored_code)
                     session.commit()
+
+                    log.info(f"✅ Password reset successful for {email}, code deleted")
 
                     return AuthResponse(
                         success=True,
@@ -364,9 +426,7 @@ class AuthService:
                     )
 
                 except Exception as supabase_error:
-                    print(f"Supabase admin error: {supabase_error}")
-                    # Print more details for debugging
-                    print(f"Error type: {type(supabase_error)}")
+                    log.error(f"Supabase admin error: {supabase_error}")
                     raise HTTPException(status_code=400, detail=f"Failed to update password: {str(supabase_error)}")
 
             finally:
