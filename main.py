@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import asyncio          # ← ADD THIS
+import logging          # ← ADD THIS (if not already there)
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
@@ -59,6 +61,21 @@ app.add_middleware(
 # Include authentication routes
 app.include_router(auth_router)
 
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks"""
+    asyncio.create_task(cleanup_expired_codes_task())
+
+    try:
+        from notam.auth.service import auth_service
+        deleted = auth_service.cleanup_expired_reset_codes()
+        if deleted > 0:
+            logging.info(f"🧹 Startup cleanup: removed {deleted} expired reset codes")
+    except Exception as e:
+        logging.error(f"Startup cleanup error: {e}")
+
+
 # -------------------- Helpers --------------------
 def _enum_val(v):
     return getattr(v, "value", v)
@@ -102,6 +119,20 @@ def _is_active_now(record: NotamRecord, now_utc: datetime) -> bool:
                 return True
         return False
     return True
+
+
+async def cleanup_expired_codes_task():
+    """Background task to clean expired reset codes every hour"""
+    from notam.auth.service import auth_service
+
+    while True:
+        try:
+            await asyncio.sleep(3600)  # 1 hour
+            deleted = auth_service.cleanup_expired_reset_codes()
+            if deleted > 0:
+                logging.info(f"🧹 Background cleanup: removed {deleted} expired reset codes")
+        except Exception as e:
+            logging.error(f"Background cleanup error: {e}")
 
 def format_notam(record: NotamRecord) -> Dict[str, Any]:
     def designator(r):
@@ -349,6 +380,8 @@ async def http_exception_handler(request, exc):
             "timestamp": datetime.now().isoformat(),
         },
     )
+
+
 
 if __name__ == "__main__":
     import uvicorn
